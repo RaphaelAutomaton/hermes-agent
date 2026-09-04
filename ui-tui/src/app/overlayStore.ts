@@ -1,11 +1,14 @@
 import { atom, computed } from 'nanostores'
 
+import type { ApprovalReq } from '../types.js'
+
 import type { OverlayState } from './interfaces.js'
 
 const buildOverlayState = (): OverlayState => ({
   agents: false,
   agentsInitialHistoryIndex: 0,
   approval: null,
+  approvalQueue: [],
   billing: null,
   clarify: null,
   confirm: null,
@@ -62,6 +65,50 @@ export const getOverlayState = () => $overlayState.get()
 
 export const patchOverlayState = (next: Partial<OverlayState> | ((state: OverlayState) => OverlayState)) =>
   $overlayState.set(typeof next === 'function' ? next($overlayState.get()) : { ...$overlayState.get(), ...next })
+
+/** Park one approval without overwriting an earlier request or duplicating a replay. */
+export const enqueueApproval = (request: ApprovalReq): boolean => {
+  const state = $overlayState.get()
+  const exists = [state.approval, ...state.approvalQueue].some(
+    current => current?.sessionId === request.sessionId && current.requestId === request.requestId
+  )
+
+  if (exists) {
+    return false
+  }
+
+  if (!state.approval) {
+    $overlayState.set({ ...state, approval: request })
+  } else {
+    $overlayState.set({ ...state, approvalQueue: [...state.approvalQueue, request] })
+  }
+
+  return true
+}
+
+/** Remove only the correlated approval and promote the next request when needed. */
+export const removeApproval = (sessionId: string, requestId: string): boolean => {
+  const state = $overlayState.get()
+
+  if (state.approval?.sessionId === sessionId && state.approval.requestId === requestId) {
+    const [approval = null, ...approvalQueue] = state.approvalQueue
+    $overlayState.set({ ...state, approval, approvalQueue })
+
+    return true
+  }
+
+  const approvalQueue = state.approvalQueue.filter(
+    request => request.sessionId !== sessionId || request.requestId !== requestId
+  )
+
+  if (approvalQueue.length === state.approvalQueue.length) {
+    return false
+  }
+
+  $overlayState.set({ ...state, approvalQueue })
+
+  return true
+}
 
 /** Full reset — used by session/turn teardown and tests. */
 export const resetOverlayState = () => $overlayState.set(buildOverlayState())

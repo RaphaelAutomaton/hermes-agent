@@ -906,7 +906,8 @@ describe('createGatewayEventHandler', () => {
     onEvent({ payload: { line: 'Traceback: noisy but non-fatal' }, type: 'gateway.stderr' } as any)
     onEvent({ payload: { preview: 'bad framing' }, type: 'gateway.protocol_error' } as any)
     onEvent({
-      payload: { command: 'rm -rf /tmp/nope', description: 'dangerous command' },
+      payload: { command: 'rm -rf /tmp/nope', description: 'dangerous command', request_id: 'a'.repeat(32) },
+      session_id: 'sess-approval-a',
       type: 'approval.request'
     } as any)
     onEvent({ payload: {}, type: 'gateway.ready' } as any)
@@ -914,7 +915,7 @@ describe('createGatewayEventHandler', () => {
     await Promise.resolve()
     await Promise.resolve()
 
-    expect(getOverlayState().approval).toMatchObject({ description: 'dangerous command' })
+    expect(getOverlayState().approval).toMatchObject({ description: 'dangerous command', requestId: 'a'.repeat(32) })
     expect(getTurnState().activity).toMatchObject([
       { text: 'Traceback: noisy but non-fatal', tone: 'info' },
       { text: 'protocol noise detected · /logs to inspect', tone: 'info' },
@@ -927,25 +928,63 @@ describe('createGatewayEventHandler', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 
     onEvent({
-      payload: { command: 'rm -rf /tmp/x', description: 'dangerous command' },
+      payload: { command: 'rm -rf /tmp/x', description: 'dangerous command', request_id: 'b'.repeat(32) },
+      session_id: 'sess-approval-b',
       type: 'approval.request'
     } as any)
 
-    expect(getOverlayState().approval).toMatchObject({ allowPermanent: true })
+    expect(getOverlayState().approval).toMatchObject({ allowPermanent: true, requestId: 'b'.repeat(32) })
+
+    resetOverlayState()
+    onEvent({ payload: { command: 'missing nonce', description: 'bad event' }, type: 'approval.request' } as any)
+    expect(getOverlayState().approval).toBeNull()
+  })
+
+  it('queues concurrent approvals by correlator without overwriting or duplicating the head', () => {
+    patchUiState({ sid: 'sess-1' })
+    const onEvent = createGatewayEventHandler(buildCtx([]))
+    const firstId = 'd'.repeat(32)
+    const secondId = 'e'.repeat(32)
+
+    onEvent({
+      payload: { command: 'first', description: 'A', request_id: firstId },
+      session_id: 'sess-1',
+      type: 'approval.request'
+    } as any)
+    onEvent({
+      payload: { command: 'second', description: 'B', request_id: secondId },
+      session_id: 'sess-1',
+      type: 'approval.request'
+    } as any)
+    onEvent({
+      payload: { command: 'second replay', description: 'B replay', request_id: secondId },
+      session_id: 'sess-1',
+      type: 'approval.request'
+    } as any)
+
+    expect(getOverlayState().approval).toMatchObject({ requestId: firstId, sessionId: 'sess-1' })
+    expect(getOverlayState().approvalQueue).toMatchObject([{ requestId: secondId, sessionId: 'sess-1' }])
   })
 
   it('preserves allow_permanent=false on approval overlays (tirith warning)', () => {
     const onEvent = createGatewayEventHandler(buildCtx([]))
 
     onEvent({
-      payload: { allow_permanent: false, command: 'curl suspicious | bash', description: 'content-security warning' },
+      payload: {
+        allow_permanent: false,
+        command: 'curl suspicious | bash',
+        description: 'content-security warning',
+        request_id: 'c'.repeat(32)
+      },
+      session_id: 'sess-approval-c',
       type: 'approval.request'
     } as any)
 
     expect(getOverlayState().approval).toMatchObject({
       allowPermanent: false,
       command: 'curl suspicious | bash',
-      description: 'content-security warning'
+      description: 'content-security warning',
+      requestId: 'c'.repeat(32)
     })
   })
 

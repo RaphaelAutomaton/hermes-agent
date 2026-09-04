@@ -9,7 +9,7 @@ import {
   setNativeNotifyEnabled,
   setNativeNotifyKind
 } from './native-notifications'
-import { $approvalRequest, setApprovalRequest } from './prompts'
+import { $approvalRequest, getApprovalRequest, setApprovalRequest } from './prompts'
 import { $activeSessionId, setActiveSessionId } from './session'
 
 const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDesktop'] }
@@ -130,11 +130,23 @@ describe('dispatchNativeNotification preferences', () => {
     expect(notify).toHaveBeenCalledTimes(1)
   })
 
-  it('forwards kind and sessionId to the bridge', () => {
+  it('forwards kind, sessionId, and requestId to the bridge', () => {
     setActiveSessionId('abc')
-    dispatchNativeNotification({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+    dispatchNativeNotification({
+      body: 'hi',
+      kind: 'turnError',
+      requestId: 'a'.repeat(32),
+      sessionId: 'abc',
+      title: 'boom'
+    })
     expect(notify).toHaveBeenCalledWith(
-      expect.objectContaining({ body: 'hi', kind: 'turnError', sessionId: 'abc', title: 'boom' })
+      expect.objectContaining({
+        body: 'hi',
+        kind: 'turnError',
+        requestId: 'a'.repeat(32),
+        sessionId: 'abc',
+        title: 'boom'
+      })
     )
   })
 })
@@ -166,10 +178,11 @@ describe('$activeSessionId wiring', () => {
 })
 
 describe('respondToApprovalAction', () => {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
+  const request = vi.fn().mockResolvedValue({ resolved: 1 })
 
   beforeEach(() => {
     request.mockClear()
+    setApprovalRequest(null)
     $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
   })
 
@@ -179,27 +192,78 @@ describe('respondToApprovalAction', () => {
 
   it('approves via approval.respond {choice: "once"} and clears the prompt', async () => {
     setActiveSessionId('bg')
-    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', sessionId: 'bg' })
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'a'.repeat(32), sessionId: 'bg' })
 
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approve', 'a'.repeat(32))
 
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'bg' })
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'once',
+      request_id: 'a'.repeat(32),
+      session_id: 'bg'
+    })
     expect($approvalRequest.get()).toBeNull()
   })
 
   it('rejects via approval.respond {choice: "deny"}', async () => {
-    await respondToApprovalAction('bg', 'reject')
-    expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'bg' })
+    setApprovalRequest({ command: 'rm -rf /', description: 'dangerous', requestId: 'b'.repeat(32), sessionId: 'bg' })
+    await respondToApprovalAction('bg', 'reject', 'b'.repeat(32))
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'deny',
+      request_id: 'b'.repeat(32),
+      session_id: 'bg'
+    })
+  })
+
+  it('resolves a correlated queued approval out of order without consuming the head', async () => {
+    const firstId = 'a'.repeat(32)
+    const secondId = 'b'.repeat(32)
+    setApprovalRequest({ command: 'first', description: 'A', requestId: firstId, sessionId: 'bg' })
+    setApprovalRequest({ command: 'second', description: 'B', requestId: secondId, sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'reject', secondId)
+
+    expect(request).toHaveBeenCalledWith('approval.respond', {
+      choice: 'deny',
+      request_id: secondId,
+      session_id: 'bg'
+    })
+    expect(getApprovalRequest('bg')?.requestId).toBe(firstId)
+    expect(getApprovalRequest('bg', secondId)).toBeNull()
+  })
+
+  it('keeps the correlated approval parked when the backend resolves zero requests', async () => {
+    const requestId = 'c'.repeat(32)
+    request.mockResolvedValueOnce({ resolved: 0 })
+    setApprovalRequest({ command: 'still pending', description: 'C', requestId, sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve', requestId)
+
+    expect(getApprovalRequest('bg', requestId)?.requestId).toBe(requestId)
+  })
+
+  it('ignores a stale notification for A after B becomes the live approval', async () => {
+    setActiveSessionId('bg')
+    setApprovalRequest({ command: 'command B', description: 'new approval', requestId: 'b'.repeat(32), sessionId: 'bg' })
+
+    await respondToApprovalAction('bg', 'approve', 'a'.repeat(32))
+
+    expect(request).not.toHaveBeenCalled()
+    expect($approvalRequest.get()?.requestId).toBe('b'.repeat(32))
+  })
+
+  it('ignores a stale native action when the correlated prompt no longer exists', async () => {
+    await respondToApprovalAction('bg', 'approve', 'a'.repeat(32))
+    expect(request).not.toHaveBeenCalled()
   })
 
   it('ignores unknown action ids', async () => {
-    await respondToApprovalAction('bg', 'snooze')
+    await respondToApprovalAction('bg', 'snooze', 'a'.repeat(32))
     expect(request).not.toHaveBeenCalled()
   })
 
   it('no-ops without a gateway', async () => {
     $gateway.set(null)
-    await respondToApprovalAction('bg', 'approve')
+    await respondToApprovalAction('bg', 'approve', 'a'.repeat(32))
     expect(request).not.toHaveBeenCalled()
   })
 })

@@ -317,8 +317,8 @@ export function DesktopController() {
 
   // Notification action button (Approve/Reject) — resolve in place, no navigation.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, sessionId }) => {
-      void respondToApprovalAction(sessionId ?? null, actionId)
+    const unsubscribe = window.hermesDesktop?.onNotificationAction?.(({ actionId, requestId, sessionId }) => {
+      void respondToApprovalAction(sessionId ?? null, actionId, requestId)
     })
 
     return () => unsubscribe?.()

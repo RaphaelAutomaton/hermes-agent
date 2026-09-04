@@ -689,19 +689,20 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         return
 
     def _reap() -> None:
-        # Serialize the orphan re-check against session.resume (which re-binds a
-        # live transport under _session_resume_lock and would make this session
-        # non-orphaned). The actual pop + teardown then goes through the shared
-        # _close_session_by_id funnel so the dict mutation happens under
-        # _sessions_lock — consistent with every other _sessions mutator
-        # (#39591: _reap previously popped under _session_resume_lock, giving no
-        # mutual exclusion against _init_session / _close_session_by_id, which
-        # guard with _sessions_lock). _sessions_lock is an RLock and the global
-        # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+        # Serialize only the orphan re-check + removal against session.resume.
+        # Teardown can run arbitrary blocking hooks (memory providers, SQLite,
+        # subprocess close) and MUST happen after releasing the process-global
+        # resume lock; otherwise one slow on_session_end freezes every resume
+        # worker while the WebSocket server still appears alive.
+        session = None
         with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
-                return
-            _close_session_by_id(sid, end_reason="ws_orphan_reap")
+            with _sessions_lock:
+                current = _sessions.get(sid)
+                if not _ws_session_is_orphaned(current):
+                    return
+                session = _sessions.pop(sid, None)
+        if session is not None:
+            _teardown_session(session, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
     timer.daemon = True
@@ -5455,11 +5456,22 @@ def _(rid, params: dict) -> dict:
             payload["status"] = "streaming"
         return payload
 
-    # Fast path: if the session is already live, reuse it under the lock.
+    # Fast path: atomically re-bind the live transport against the orphan
+    # reaper, then build the potentially expensive response OUTSIDE the
+    # process-global resume lock. _live_session_payload calls _session_info,
+    # which probes git/skills/providers and can take arbitrarily long; doing
+    # that under this lock freezes every concurrent session.resume.
+    live = None
     with _session_resume_lock:
         live = _find_live_session_by_key(target)
         if live is not None:
-            return _ok(rid, _reuse_live_payload(*live))
+            _sid, live_session = live
+            with live_session["history_lock"]:
+                live_session["cols"] = cols
+                live_session["transport"] = current_transport() or _stdio_transport
+                live_session["last_active"] = time.time()
+    if live is not None:
+        return _ok(rid, _reuse_live_payload(*live))
 
     # Lazy/watch resume: register the live session WITHOUT building an agent.
     # Used by the desktop's subagent windows — the child runs inside the
@@ -9855,6 +9867,18 @@ def _(rid, params: dict) -> dict:
 
 @method("approval.respond")
 def _(rid, params: dict) -> dict:
+    if set(params) != {"session_id", "request_id", "choice"}:
+        return _err(rid, 4002, "approval.respond requires session_id, request_id, and choice")
+    request_id = params.get("request_id")
+    if (
+        not isinstance(request_id, str)
+        or len(request_id) != 32
+        or any(char not in "0123456789abcdef" for char in request_id)
+    ):
+        return _err(rid, 4002, "invalid approval request_id")
+    choice = params.get("choice")
+    if choice not in {"once", "session", "always", "deny"}:
+        return _err(rid, 4002, "invalid approval choice")
     session, err = _sess(params, rid)
     if err:
         return err
@@ -9866,8 +9890,9 @@ def _(rid, params: dict) -> dict:
             {
                 "resolved": resolve_gateway_approval(
                     session["session_key"],
-                    params.get("choice", "deny"),
-                    resolve_all=params.get("all", False),
+                    choice,
+                    resolve_all=False,
+                    request_id=request_id,
                 )
             },
         )

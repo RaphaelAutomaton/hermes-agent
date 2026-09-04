@@ -757,6 +757,83 @@ def test_session_resume_missing_row_non_lazy_still_errors(server, monkeypatch):
     assert "session not found" in resp2["error"]["message"].lower()
 
 
+def test_session_resume_releases_global_lock_before_live_payload(server, monkeypatch):
+    """Live-session payload construction must not serialize all resumes.
+
+    ``_session_info`` discovers git/skills/providers and may be slow.  Rebinding
+    the winning live session is atomic, but that payload work must happen after
+    releasing the process-global resume lock.
+    """
+    target = "20260827_181056_live"
+    payload_started = threading.Event()
+    allow_payload = threading.Event()
+    holder: dict[str, object] = {}
+
+    class _DB:
+        def get_session(self, _sid):
+            return {"id": target}
+
+        def get_session_by_title(self, _title):
+            return None
+
+        def resolve_resume_session_id(self, _target):
+            return target
+
+    session = {
+        "agent": types.SimpleNamespace(session_id=target),
+        "history_lock": threading.RLock(),
+        "session_key": target,
+        "transport": server._detached_ws_transport,
+    }
+    server._sessions["live"] = session
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+
+    def _slow_payload(sid, current, **_kwargs):
+        assert sid == "live"
+        assert current is session
+        payload_started.set()
+        assert allow_payload.wait(timeout=2.0)
+        return {
+            "info": {},
+            "message_count": 0,
+            "messages": [],
+            "running": False,
+            "session_id": sid,
+            "session_key": target,
+            "status": "idle",
+        }
+
+    monkeypatch.setattr(server, "_live_session_payload", _slow_payload)
+
+    def _resume():
+        holder["response"] = server.handle_request(
+            {
+                "id": "resume-live",
+                "method": "session.resume",
+                "params": {"session_id": target, "cols": 100},
+            }
+        )
+
+    worker = threading.Thread(target=_resume, daemon=True)
+    worker.start()
+    assert payload_started.wait(timeout=1.0)
+
+    acquired = server._session_resume_lock.acquire(timeout=0.2)
+    try:
+        assert acquired, "live payload construction held the global session-resume lock"
+    finally:
+        if acquired:
+            server._session_resume_lock.release()
+        allow_payload.set()
+        worker.join(timeout=1.0)
+
+    assert not worker.is_alive()
+    response = holder["response"]
+    assert isinstance(response, dict)
+    assert "error" not in response
+    assert response["result"]["session_id"] == "live"
+
+
 def test_session_resume_reuses_existing_live_session(server, monkeypatch):
     """Repeated resume must not allocate duplicate live agents."""
 
@@ -1108,6 +1185,58 @@ def test_session_activate_rebinds_orphaned_ws_session_to_current_transport(serve
     assert resp["result"]["session_id"] == sid
     assert server._sessions[sid]["transport"] is new_transport
     assert not server._ws_session_is_orphaned(server._sessions[sid])
+
+
+def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(server, monkeypatch):
+    """A slow memory/finalization hook must not freeze every session.resume.
+
+    Regression for the Ariadne incident where Scope Recall journal persistence
+    blocked inside orphan teardown while ``_reap`` still held the process-global
+    ``_session_resume_lock``. All eight long-RPC workers then queued at the resume
+    fast path and the runtime kept accepting WebSockets without answering resume.
+    """
+    callbacks: list[object] = []
+    teardown_started = threading.Event()
+    allow_teardown = threading.Event()
+
+    class _Timer:
+        daemon = False
+
+        def __init__(self, _delay, callback):
+            callbacks.append(callback)
+
+        def start(self):
+            return None
+
+    def _slow_teardown(_session, *, end_reason="tui_close"):
+        assert end_reason == "ws_orphan_reap"
+        teardown_started.set()
+        assert allow_teardown.wait(timeout=2.0)
+
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_teardown_session", _slow_teardown)
+    server._sessions.clear()
+    server._sessions["orphan"] = {
+        "transport": server._detached_ws_transport,
+        "running": False,
+    }
+
+    server._schedule_ws_orphan_reap("orphan")
+    reaper = threading.Thread(target=callbacks[0], daemon=True)
+    reaper.start()
+    assert teardown_started.wait(timeout=1.0)
+
+    acquired = server._session_resume_lock.acquire(timeout=0.2)
+    try:
+        assert acquired, "slow orphan teardown held the global session-resume lock"
+    finally:
+        if acquired:
+            server._session_resume_lock.release()
+        allow_teardown.set()
+        reaper.join(timeout=1.0)
+
+    assert not reaper.is_alive()
+    assert "orphan" not in server._sessions
 
 
 def test_session_branch_persists_branched_from_marker(server, monkeypatch):

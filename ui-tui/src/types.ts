@@ -94,6 +94,8 @@ export interface ApprovalReq {
   allowPermanent?: boolean
   command: string
   description: string
+  requestId: string
+  sessionId: string
 }
 
 export interface ConfirmReq {

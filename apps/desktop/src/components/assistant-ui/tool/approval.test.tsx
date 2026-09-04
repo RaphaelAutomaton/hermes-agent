@@ -32,11 +32,17 @@ function part(toolName: string): ToolPart {
 
 function setRequest(command = 'rm -rf /tmp/x', allowPermanent?: boolean) {
   $activeSessionId.set('sess-1')
-  setApprovalRequest({ allowPermanent, command, description: 'dangerous command', sessionId: 'sess-1' })
+  setApprovalRequest({
+    allowPermanent,
+    command,
+    description: 'dangerous command',
+    requestId: 'a'.repeat(32),
+    sessionId: 'sess-1'
+  })
 }
 
-function mockGateway() {
-  const request = vi.fn().mockResolvedValue({ resolved: true })
+function mockGateway(result: { resolved: number } = { resolved: 1 }) {
+  const request = vi.fn().mockResolvedValue(result)
   $gateway.set({ request } as unknown as HermesGateway)
 
   return request
@@ -79,9 +85,26 @@ describe('PendingToolApproval', () => {
     fireEvent.click(screen.getByRole('button', { name: /Run/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'once', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'once',
+        request_id: 'a'.repeat(32),
+        session_id: 'sess-1'
+      })
     })
     expect($approvalRequest.get()).toBeNull()
+  })
+
+  it('keeps the request and re-enables actions when the backend resolves zero requests', async () => {
+    mockGateway({ resolved: 0 })
+    setRequest()
+    render(<PendingToolApproval part={part('terminal')} />)
+
+    fireEvent.click(screen.getByRole('button', { name: /Run/ }))
+
+    await waitFor(() => {
+      expect($approvalRequest.get()?.requestId).toBe('a'.repeat(32))
+      expect((screen.getByRole('button', { name: /Run/ }) as HTMLButtonElement).disabled).toBe(false)
+    })
   })
 
   it('reveals the full command inline when the Command toggle is clicked', () => {
@@ -105,7 +128,11 @@ describe('PendingToolApproval', () => {
     fireEvent.click(screen.getByRole('button', { name: /Reject/ }))
 
     await waitFor(() => {
-      expect(request).toHaveBeenCalledWith('approval.respond', { choice: 'deny', session_id: 'sess-1' })
+      expect(request).toHaveBeenCalledWith('approval.respond', {
+        choice: 'deny',
+        request_id: 'a'.repeat(32),
+        session_id: 'sess-1'
+      })
     })
   })
 

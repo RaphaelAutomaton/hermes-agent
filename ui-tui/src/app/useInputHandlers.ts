@@ -5,7 +5,6 @@ import { useEffect, useRef } from 'react'
 import { DASHBOARD_TUI_MODE } from '../config/env.js'
 import { TYPING_IDLE_MS } from '../config/timing.js'
 import type {
-  ApprovalRespondResponse,
   ConfigSetResponse,
   SecretRespondResponse,
   SudoRespondResponse,
@@ -15,6 +14,7 @@ import { isAction, isCopyShortcut, isMac, isVoiceToggleKey } from '../lib/platfo
 import { computePrecisionWheelStep, initPrecisionWheel } from '../lib/precisionWheel.js'
 import { computeWheelStep, initWheelAccelForHost } from '../lib/wheelAccel.js'
 
+import { respondToApproval } from './approvalResponses.js'
 import { getInputSelection } from './inputSelectionStore.js'
 import type { InputHandlerActions, InputHandlerContext, InputHandlerResult } from './interfaces.js'
 import { $isBlocked, $overlayState, patchOverlayState } from './overlayStore.js'
@@ -144,9 +144,13 @@ export function useInputHandlers(ctx: InputHandlerContext): InputHandlerResult {
     }
 
     if (overlay.approval) {
-      return gateway
-        .rpc<ApprovalRespondResponse>('approval.respond', { choice: 'deny', session_id: getUiState().sid })
-        .then(r => r && (patchOverlayState({ approval: null }), patchTurnState({ outcome: 'denied' })))
+      const approval = overlay.approval
+
+      return respondToApproval(gateway.rpc, approval, 'deny').then(resolved => {
+        if (resolved) {
+          patchTurnState({ outcome: 'denied' })
+        }
+      })
     }
 
     if (overlay.sudo) {

@@ -457,29 +457,34 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // surfaces once the user focuses that chat.
         const command = typeof payload?.command === 'string' ? payload.command : ''
         const description = typeof payload?.description === 'string' ? payload.description : 'dangerous command'
+        const requestId = typeof payload?.request_id === 'string' ? payload.request_id : ''
 
-        setApprovalRequest({
-          // false only when a tirith warning forbids it; backend omits the field otherwise.
-          allowPermanent: payload?.allow_permanent !== false,
-          command,
-          description,
-          sessionId: sessionId ?? null
-        })
+        if (/^[0-9a-f]{32}$/.test(requestId)) {
+          setApprovalRequest({
+            // false only when a tirith warning forbids it; backend omits the field otherwise.
+            allowPermanent: payload?.allow_permanent !== false,
+            command,
+            description,
+            requestId,
+            sessionId: sessionId ?? null
+          })
 
-        if (sessionId) {
-          updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+          if (sessionId) {
+            updateSessionState(sessionId, state => ({ ...state, needsInput: true }))
+          }
+
+          dispatchNativeNotification({
+            actions: [
+              { id: 'approve', text: translateNow('notifications.native.approveAction') },
+              { id: 'reject', text: translateNow('notifications.native.rejectAction') }
+            ],
+            body: command || description,
+            kind: 'approval',
+            requestId,
+            sessionId,
+            title: translateNow('notifications.native.approvalTitle')
+          })
         }
-
-        dispatchNativeNotification({
-          actions: [
-            { id: 'approve', text: translateNow('notifications.native.approveAction') },
-            { id: 'reject', text: translateNow('notifications.native.rejectAction') }
-          ],
-          body: command || description,
-          kind: 'approval',
-          sessionId,
-          title: translateNow('notifications.native.approvalTitle')
-        })
       } else if (event.type === 'sudo.request') {
         // Sudo password capture (tools/terminal_tool.py). Blocked on
         // sudo.respond {request_id, password}.

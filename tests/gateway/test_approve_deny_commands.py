@@ -155,6 +155,119 @@ class TestBlockingGatewayApproval:
         assert not e2.event.is_set()
         assert len(_gateway_queues[session_key]) == 1
 
+    def test_resolve_single_by_request_id_never_pops_a_different_entry(self):
+        """Correlated TUI clients must resolve exactly the approval they saw."""
+        from tools.approval import (
+            resolve_gateway_approval,
+            _ApprovalEntry, _gateway_queues,
+        )
+        session_key = "test-correlated"
+        e1 = _ApprovalEntry({"command": "first", "request_id": "tool_first"})
+        e2 = _ApprovalEntry({"command": "second", "request_id": "tool_second"})
+        _gateway_queues[session_key] = [e1, e2]
+
+        assert resolve_gateway_approval(
+            session_key, "deny", request_id="missing"
+        ) == 0
+        assert _gateway_queues[session_key] == [e1, e2]
+        assert not e1.event.is_set()
+        assert not e2.event.is_set()
+
+        assert resolve_gateway_approval(
+            session_key, "once", request_id="tool_second"
+        ) == 1
+        assert not e1.event.is_set()
+        assert e2.event.is_set()
+        assert e2.result == "once"
+        assert _gateway_queues[session_key] == [e1]
+
+    def test_gateway_approval_gets_stable_request_id_end_to_end(self):
+        """Every notified approval carries a unique opaque correlator end to end."""
+        from tools.approval import (
+            _await_gateway_decision,
+            reset_current_observability_context,
+            resolve_gateway_approval,
+            set_current_observability_context,
+        )
+        session_key = "test-request-id"
+        notified = []
+        tokens = set_current_observability_context(
+            turn_id="turn_123", tool_call_id="tool_123"
+        )
+
+        def notify(data):
+            notified.append(dict(data))
+            assert resolve_gateway_approval(
+                session_key, "deny", request_id=data["request_id"]
+            ) == 1
+
+        try:
+            decision = _await_gateway_decision(
+                session_key,
+                notify,
+                {
+                    "command": "dangerous",
+                    "description": "test",
+                    "pattern_key": "danger",
+                    "pattern_keys": ["danger"],
+                },
+            )
+        finally:
+            reset_current_observability_context(tokens)
+
+        assert len(notified[0]["request_id"]) == 32
+        assert notified[0]["request_id"].isalnum()
+        assert decision == {"resolved": True, "choice": "deny", "reason": None}
+
+    def test_concurrent_gateway_approvals_get_distinct_correlators(self):
+        """Concurrent approvals in one session remain independently addressable."""
+        from tools.approval import _await_gateway_decision, resolve_gateway_approval
+
+        session_key = "test-concurrent-request-ids"
+        barrier = threading.Barrier(2)
+        notified = []
+        decisions = []
+        failures = []
+
+        def notify(data):
+            notified.append(dict(data))
+            barrier.wait(timeout=5)
+            assert resolve_gateway_approval(
+                session_key, "deny", request_id=data["request_id"]
+            ) == 1
+
+        def run(command):
+            try:
+                decisions.append(
+                    _await_gateway_decision(
+                        session_key,
+                        notify,
+                        {"command": command, "description": "dangerous"},
+                    )
+                )
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=("first",)),
+            threading.Thread(target=run, args=("second",)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+
+        assert all(not thread.is_alive() for thread in threads)
+        assert failures == []
+        request_ids = [item["request_id"] for item in notified]
+        assert len(request_ids) == 2
+        assert len(set(request_ids)) == 2
+        assert all(len(request_id) == 32 for request_id in request_ids)
+        assert decisions == [
+            {"resolved": True, "choice": "deny", "reason": None},
+            {"resolved": True, "choice": "deny", "reason": None},
+        ]
+
     def test_unregister_signals_all_entries(self):
         """unregister_gateway_notify signals all waiting entries to prevent hangs."""
         from tools.approval import (

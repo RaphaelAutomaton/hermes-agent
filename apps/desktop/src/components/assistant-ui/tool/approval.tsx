@@ -24,6 +24,7 @@ import {
   $approvalRequest,
   type ApprovalRequest,
   clearApprovalRequest,
+  getApprovalRequest,
   registerApprovalInlineAnchor
 } from '@/store/prompts'
 
@@ -115,8 +116,8 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
   const respond = useCallback(
     async (choice: ApprovalChoice) => {
       // Another bar (or the keyboard path) may have already resolved this
-      // approval; the atom is the single source of truth, so bail if it's gone.
-      if (busy || !$approvalRequest.get()) {
+      // exact approval; fail closed if this component's correlator is gone.
+      if (busy || !getApprovalRequest(request.sessionId, request.requestId)) {
         return
       }
 
@@ -129,18 +130,26 @@ const ApprovalBar: FC<{ request: ApprovalRequest; surface: 'floating' | 'inline'
       setSubmitting(choice)
 
       try {
-        await gateway.request<{ resolved?: boolean }>('approval.respond', {
+        const result = await gateway.request<{ resolved: number }>('approval.respond', {
           choice,
+          request_id: request.requestId,
           session_id: request.sessionId ?? undefined
         })
+
+        if (result.resolved !== 1) {
+          setSubmitting(null)
+
+          return
+        }
+
         triggerHaptic(choice === 'deny' ? 'cancel' : 'submit')
-        clearApprovalRequest(request.sessionId)
+        clearApprovalRequest(request.sessionId, request.requestId)
       } catch (error) {
         notifyError(error, copy.sendFailed)
         setSubmitting(null)
       }
     },
-    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.sessionId]
+    [busy, copy.gatewayDisconnected, copy.sendFailed, gateway, request.requestId, request.sessionId]
   )
 
   // ⌘/Ctrl+Enter → Run, Esc → Reject.

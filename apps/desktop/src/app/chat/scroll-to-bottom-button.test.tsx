@@ -9,7 +9,12 @@ import { ScrollToBottomButton } from './scroll-to-bottom-button'
 
 function pendingApproval() {
   $activeSessionId.set('sess-1')
-  setApprovalRequest({ command: 'rm -rf /tmp/x', description: 'dangerous command', sessionId: 'sess-1' })
+  setApprovalRequest({
+    command: 'rm -rf /tmp/x',
+    description: 'dangerous command',
+    requestId: 'a'.repeat(32),
+    sessionId: 'sess-1'
+  })
 }
 
 afterEach(() => {
