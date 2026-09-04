@@ -122,7 +122,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 
 # Cap on user-controlled FTS5 query input before regex/sanitizer processing.
 # Search queries do not need to be arbitrarily large, and bounding them keeps
@@ -767,6 +767,45 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0
 );
 
+CREATE TABLE IF NOT EXISTS turn_receipts (
+    turn_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    client_turn_id TEXT NOT NULL,
+    tip_session_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (
+        state IN (
+            'ACCEPTED', 'STARTING', 'RUNNING', 'WAITING_INPUT',
+            'SUCCEEDED', 'FAILED', 'INTERRUPTED', 'INTERRUPTED_UNKNOWN'
+        )
+    ),
+    accepted_at REAL NOT NULL,
+    started_at REAL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    accepted_by_writer_id TEXT NOT NULL,
+    accepted_by_pid INTEGER,
+    accepted_by_process_started_at REAL,
+    writer_id TEXT,
+    writer_pid INTEGER,
+    writer_process_started_at REAL,
+    writer_generation INTEGER,
+    error_code TEXT,
+    error_detail TEXT,
+    terminal_message_id INTEGER,
+    UNIQUE (conversation_id, client_turn_id)
+);
+
+CREATE TABLE IF NOT EXISTS turn_writer_fences (
+    conversation_id TEXT PRIMARY KEY,
+    generation INTEGER NOT NULL,
+    turn_id TEXT,
+    writer_id TEXT,
+    writer_pid INTEGER,
+    writer_process_started_at REAL,
+    updated_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -793,6 +832,13 @@ CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_conversation_time
+    ON turn_receipts(conversation_id, accepted_at DESC);
+CREATE INDEX IF NOT EXISTS idx_turn_receipts_state_updated
+    ON turn_receipts(state, updated_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_turn_receipts_one_active_conversation
+    ON turn_receipts(conversation_id)
+    WHERE state IN ('ACCEPTED', 'STARTING', 'RUNNING', 'WAITING_INPUT');
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -802,6 +848,8 @@ CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(ex
 DEFERRED_INDEX_SQL = """
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
     ON messages(session_id, active, timestamp);
+CREATE INDEX IF NOT EXISTS idx_messages_session_active_id
+    ON messages(session_id, active, id);
 CREATE INDEX IF NOT EXISTS idx_messages_active_null
     ON messages(active) WHERE active IS NULL;
 CREATE INDEX IF NOT EXISTS idx_sessions_session_key
@@ -4030,6 +4078,421 @@ class SessionDB:
                 current = child_id
 
             return best if best is not None else session_id
+
+    def get_turn_receipt(self, turn_id: str) -> Optional[Dict[str, Any]]:
+        """Return one durable turn receipt without materializing a runtime."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_id = ?",
+                (turn_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_turn_receipt_by_client_id(
+        self, conversation_id: str, client_turn_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve an idempotency key inside one logical conversation."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM turn_receipts "
+                "WHERE conversation_id = ? AND client_turn_id = ?",
+                (conversation_id, client_turn_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def accept_turn_receipt(
+        self, receipt: Dict[str, Any]
+    ) -> tuple[str, Dict[str, Any]]:
+        """Atomically accept, deduplicate, or reject a durable turn intent.
+
+        Returns ``(outcome, row)`` where outcome is ``accepted``, ``duplicate``,
+        ``conflict``, or ``busy``.  ``BEGIN IMMEDIATE`` serializes acceptance
+        across gateway processes before any execution is scheduled.
+        """
+        active_states = ("ACCEPTED", "STARTING", "RUNNING", "WAITING_INPUT")
+
+        def _accept(conn):
+            existing = conn.execute(
+                "SELECT * FROM turn_receipts "
+                "WHERE conversation_id = ? AND client_turn_id = ?",
+                (receipt["conversation_id"], receipt["client_turn_id"]),
+            ).fetchone()
+            if existing is not None:
+                row = dict(existing)
+                outcome = "duplicate" if row["request_hash"] == receipt["request_hash"] else "conflict"
+                return outcome, row
+            placeholders = ",".join("?" for _ in active_states)
+            active = conn.execute(
+                "SELECT * FROM turn_receipts WHERE conversation_id = ? "
+                f"AND state IN ({placeholders}) LIMIT 1",
+                (receipt["conversation_id"], *active_states),
+            ).fetchone()
+            if active is not None:
+                return "busy", dict(active)
+            columns = tuple(receipt)
+            conn.execute(
+                f"INSERT INTO turn_receipts ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                tuple(receipt[column] for column in columns),
+            )
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_id = ?",
+                (receipt["turn_id"],),
+            ).fetchone()
+            return "accepted", dict(row)
+
+        return self._execute_write(_accept)
+
+    def recover_turn_receipts(
+        self,
+        *,
+        now: float,
+        is_writer_alive: Callable[[str, Optional[int], Optional[float]], bool],
+    ) -> List[Dict[str, Any]]:
+        """Recover non-terminal receipts in one write transaction.
+
+        The returned rows are the ACCEPTED receipts that callers may safely
+        reschedule. Owned states are left untouched unless the injected
+        liveness authority can prove their exact writer identity is dead.
+        """
+        def _recover(conn):
+            rows = conn.execute(
+                "SELECT * FROM turn_receipts "
+                "WHERE state IN ('ACCEPTED', 'STARTING', 'RUNNING', 'WAITING_INPUT') "
+                "ORDER BY accepted_at, turn_id"
+            ).fetchall()
+            reschedulable: List[Dict[str, Any]] = []
+            for row in rows:
+                if row["state"] == "ACCEPTED":
+                    reschedulable.append(dict(row))
+                    continue
+                if not row["writer_id"]:
+                    continue
+                try:
+                    alive = is_writer_alive(
+                        str(row["writer_id"]),
+                        int(row["writer_pid"]) if row["writer_pid"] is not None else None,
+                        (
+                            float(row["writer_process_started_at"])
+                            if row["writer_process_started_at"] is not None
+                            else None
+                        ),
+                    )
+                except Exception:
+                    # An unavailable liveness authority must not cause destructive
+                    # recovery. Unknown ownership is treated as live.
+                    continue
+                if alive:
+                    continue
+                if row["state"] == "STARTING":
+                    changed = conn.execute(
+                        "UPDATE turn_receipts SET state='ACCEPTED', started_at=NULL, "
+                        "updated_at=?, writer_id=NULL, writer_pid=NULL, "
+                        "writer_process_started_at=NULL, writer_generation=NULL "
+                        "WHERE turn_id=? AND state='STARTING' AND writer_id=? "
+                        "AND writer_generation=?",
+                        (now, row["turn_id"], row["writer_id"], row["writer_generation"]),
+                    ).rowcount
+                    if changed != 1:
+                        continue
+                    conn.execute(
+                        "UPDATE turn_writer_fences SET turn_id=NULL, writer_id=NULL, "
+                        "writer_pid=NULL, writer_process_started_at=NULL, updated_at=? "
+                        "WHERE conversation_id=? AND turn_id=? AND writer_id=? "
+                        "AND generation=?",
+                        (
+                            now,
+                            row["conversation_id"],
+                            row["turn_id"],
+                            row["writer_id"],
+                            row["writer_generation"],
+                        ),
+                    )
+                    recovered = conn.execute(
+                        "SELECT * FROM turn_receipts WHERE turn_id=?", (row["turn_id"],)
+                    ).fetchone()
+                    reschedulable.append(dict(recovered))
+                    continue
+                if row["state"] not in ("RUNNING", "WAITING_INPUT"):
+                    continue
+                changed = conn.execute(
+                    "UPDATE turn_receipts SET state='INTERRUPTED_UNKNOWN', "
+                    "updated_at=?, completed_at=?, error_code='INTERRUPTED_UNKNOWN', "
+                    "error_detail=? WHERE turn_id=? "
+                    "AND state IN ('RUNNING', 'WAITING_INPUT') AND writer_id=? "
+                    "AND writer_generation=?",
+                    (
+                        now,
+                        now,
+                        "Owning writer was not alive during durable turn recovery.",
+                        row["turn_id"],
+                        row["writer_id"],
+                        row["writer_generation"],
+                    ),
+                ).rowcount
+                if changed != 1:
+                    continue
+                conn.execute(
+                    "UPDATE turn_writer_fences SET turn_id=NULL, writer_id=NULL, "
+                    "writer_pid=NULL, writer_process_started_at=NULL, updated_at=? "
+                    "WHERE conversation_id=? AND turn_id=? AND writer_id=? "
+                    "AND generation=?",
+                    (
+                        now,
+                        row["conversation_id"],
+                        row["turn_id"],
+                        row["writer_id"],
+                        row["writer_generation"],
+                    ),
+                )
+            return reschedulable
+
+        return self._execute_write(_recover)
+
+    def claim_turn_start(
+        self,
+        turn_id: str,
+        *,
+        writer_id: str,
+        writer_pid: Optional[int],
+        writer_process_started_at: Optional[float],
+        now: float,
+    ) -> Optional[tuple[Dict[str, Any], int]]:
+        """Atomically fence one ACCEPTED receipt and move it to STARTING."""
+        def _claim(conn):
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            if row is None or row["state"] != "ACCEPTED":
+                return None
+            fence_row = conn.execute(
+                "SELECT generation FROM turn_writer_fences WHERE conversation_id = ?",
+                (row["conversation_id"],),
+            ).fetchone()
+            generation = int(fence_row["generation"] if fence_row is not None else 0) + 1
+            conn.execute(
+                "INSERT INTO turn_writer_fences "
+                "(conversation_id, generation, turn_id, writer_id, writer_pid, "
+                " writer_process_started_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(conversation_id) DO UPDATE SET "
+                "generation=excluded.generation, turn_id=excluded.turn_id, "
+                "writer_id=excluded.writer_id, writer_pid=excluded.writer_pid, "
+                "writer_process_started_at=excluded.writer_process_started_at, "
+                "updated_at=excluded.updated_at",
+                (
+                    row["conversation_id"], generation, turn_id, writer_id,
+                    writer_pid, writer_process_started_at, now,
+                ),
+            )
+            changed = conn.execute(
+                "UPDATE turn_receipts SET state='STARTING', started_at=?, updated_at=?, "
+                "writer_id=?, writer_pid=?, writer_process_started_at=?, writer_generation=? "
+                "WHERE turn_id=? AND state='ACCEPTED'",
+                (
+                    now, now, writer_id, writer_pid, writer_process_started_at,
+                    generation, turn_id,
+                ),
+            ).rowcount
+            if changed != 1:
+                raise RuntimeError("turn receipt changed while claiming writer fence")
+            claimed = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_id = ?", (turn_id,)
+            ).fetchone()
+            return dict(claimed), generation
+
+        return self._execute_write(_claim)
+
+    def is_turn_fence_current(
+        self, conversation_id: str, turn_id: str, writer_id: str, generation: int
+    ) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM turn_writer_fences WHERE conversation_id=? "
+                "AND turn_id=? AND writer_id=? AND generation=?",
+                (conversation_id, turn_id, writer_id, generation),
+            ).fetchone()
+        return row is not None
+
+    def transition_turn_receipt(
+        self,
+        *,
+        turn_id: str,
+        conversation_id: str,
+        writer_id: str,
+        generation: int,
+        expected_states: tuple[str, ...],
+        target_state: str,
+        now: float,
+        completed_at: Optional[float] = None,
+        tip_session_id: Optional[str] = None,
+        terminal_message_id: Optional[int] = None,
+        error_code: Optional[str] = None,
+        error_detail: Optional[str] = None,
+        clear_fence: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        """Apply one fenced turn transition and return the committed row."""
+        if not expected_states:
+            raise ValueError("expected_states required")
+
+        def _transition(conn):
+            placeholders = ",".join("?" for _ in expected_states)
+            assignments = ["state=?", "updated_at=?"]
+            values: List[Any] = [target_state, now]
+            optional = (
+                ("completed_at", completed_at),
+                ("tip_session_id", tip_session_id),
+                ("terminal_message_id", terminal_message_id),
+                ("error_code", error_code),
+                ("error_detail", error_detail),
+            )
+            for column, value in optional:
+                if value is not None:
+                    assignments.append(f"{column}=?")
+                    values.append(value)
+            values.extend(
+                [turn_id, *expected_states, writer_id, generation,
+                 conversation_id, turn_id, writer_id, generation]
+            )
+            changed = conn.execute(
+                f"UPDATE turn_receipts SET {','.join(assignments)} "
+                f"WHERE turn_id=? AND state IN ({placeholders}) "
+                "AND writer_id=? AND writer_generation=? "
+                "AND EXISTS (SELECT 1 FROM turn_writer_fences f "
+                "WHERE f.conversation_id=? AND f.turn_id=? "
+                "AND f.writer_id=? AND f.generation=?)",
+                tuple(values),
+            ).rowcount
+            if changed != 1:
+                return None
+            if clear_fence:
+                conn.execute(
+                    "UPDATE turn_writer_fences SET turn_id=NULL, writer_id=NULL, "
+                    "writer_pid=NULL, writer_process_started_at=NULL, updated_at=? "
+                    "WHERE conversation_id=? AND turn_id=? AND writer_id=? AND generation=?",
+                    (now, conversation_id, turn_id, writer_id, generation),
+                )
+            row = conn.execute(
+                "SELECT * FROM turn_receipts WHERE turn_id=?", (turn_id,)
+            ).fetchone()
+            return dict(row)
+
+        return self._execute_write(_transition)
+
+    def resolve_conversation_lineage(self, session_id: str) -> tuple[str, str, List[str]]:
+        """Resolve a physical session alias to its logical compression lineage.
+
+        Only compression continuations are folded into one conversation. Explicit
+        branches, delegates, and tool children remain separate logical conversations.
+        The returned tuple is ``(conversation_id, tip_session_id, root_to_tip_ids)``.
+        """
+        if not session_id:
+            raise ValueError("session_id required")
+        tip = self.get_compression_tip(session_id)
+        with self._lock:
+            if self._conn.execute("SELECT 1 FROM sessions WHERE id = ?", (tip,)).fetchone() is None:
+                raise KeyError(session_id)
+            reverse_chain = [tip]
+            current = tip
+            seen = {tip}
+            for _ in range(100):
+                row = self._conn.execute(
+                    """
+                    SELECT child.parent_session_id,
+                           child.source AS child_source,
+                           child.model_config AS child_model_config,
+                           parent.end_reason AS parent_end_reason
+                    FROM sessions child
+                    LEFT JOIN sessions parent ON parent.id = child.parent_session_id
+                    WHERE child.id = ?
+                    """,
+                    (current,),
+                ).fetchone()
+                if row is None or not row["parent_session_id"]:
+                    break
+                parent_id = row["parent_session_id"]
+                if parent_id in seen or row["parent_end_reason"] != "compression":
+                    break
+                try:
+                    child_config = json.loads(row["child_model_config"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    child_config = {}
+                if (
+                    child_config.get("_branched_from") is not None
+                    or child_config.get("_delegate_from") is not None
+                    or (row["child_source"] or "") == "tool"
+                ):
+                    break
+                reverse_chain.append(parent_id)
+                seen.add(parent_id)
+                current = parent_id
+            lineage = list(reversed(reverse_chain))
+        return lineage[0], tip, lineage
+
+    def read_message_rows_page(
+        self,
+        session_ids: List[str],
+        *,
+        snapshot_max_id: Optional[int] = None,
+        before_id: Optional[int] = None,
+        limit: int = 50,
+        roles: Optional[List[str]] = None,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Read newest-first raw message rows from a stable insertion-id snapshot.
+
+        This method is deliberately persistence-only: it never resumes a session or
+        builds an agent. ``limit + 1`` rows are returned so callers can determine
+        whether an older page exists without OFFSET pagination.
+        """
+        if not session_ids:
+            return [], int(snapshot_max_id or 0)
+        bounded_limit = max(1, min(int(limit), 1000))
+        session_placeholders = ",".join("?" for _ in session_ids)
+        role_clause = ""
+        role_params: List[Any] = []
+        if roles:
+            role_placeholders = ",".join("?" for _ in roles)
+            role_clause = f" AND role IN ({role_placeholders})"
+            role_params.extend(roles)
+        with self._lock:
+            if snapshot_max_id is None:
+                row = self._conn.execute(
+                    f"SELECT COALESCE(MAX(id), 0) AS max_id FROM messages "
+                    f"WHERE session_id IN ({session_placeholders}) AND active = 1{role_clause}",
+                    tuple(session_ids) + tuple(role_params),
+                ).fetchone()
+                snapshot_max_id = int(row["max_id"] or 0)
+            effective_before = int(before_id) if before_id is not None else int(snapshot_max_id) + 1
+            rows = self._conn.execute(
+                "SELECT id, session_id, role, content, tool_call_id, tool_calls, tool_name, "
+                "timestamp, finish_reason, reasoning, reasoning_content, reasoning_details, "
+                "codex_reasoning_items, codex_message_items, platform_message_id, observed "
+                f"FROM messages WHERE session_id IN ({session_placeholders}) "
+                f"AND active = 1 AND id <= ? AND id < ?{role_clause} "
+                "ORDER BY id DESC LIMIT ?",
+                tuple(session_ids)
+                + (int(snapshot_max_id), effective_before)
+                + tuple(role_params)
+                + (bounded_limit + 1,),
+            ).fetchall()
+        decoded = []
+        json_fields = {
+            "tool_calls",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+        }
+        for row in rows:
+            item = dict(row)
+            item["content"] = self._decode_content(item.get("content"))
+            for field in json_fields:
+                if item.get(field):
+                    try:
+                        item[field] = json.loads(item[field])
+                    except (TypeError, json.JSONDecodeError):
+                        item[field] = None
+            item["observed"] = bool(item.get("observed"))
+            decoded.append(item)
+        return decoded, int(snapshot_max_id)
 
     def get_messages_as_conversation(
         self,

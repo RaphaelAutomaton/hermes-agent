@@ -28,6 +28,13 @@ from utils import is_truthy_value
 from tools.environments.local import hermes_subprocess_env
 from agent.replay_cleanup import sanitize_replay_history
 from tui_gateway import git_probe
+from tui_gateway.session_event_hub import SubscriptionHub
+from tui_gateway.session_runtime import (
+    ExecutionCapacityExceeded,
+    RuntimePolicy,
+    RuntimeState,
+    SessionRuntimeManager,
+)
 from tui_gateway.transport import (
     StdioTransport,
     Transport,
@@ -140,6 +147,48 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
+
+
+def _runtime_env_int(name: str, default: int, *, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name) or default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _runtime_env_float(name: str, default: float) -> float | None:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return None if value <= 0 else value
+
+
+def _runtime_rss_bytes() -> int:
+    import psutil
+
+    return int(psutil.Process(os.getpid()).memory_info().rss)
+
+
+_runtime_manager = SessionRuntimeManager(
+    RuntimePolicy(
+        max_hot_idle=_runtime_env_int("HERMES_TUI_MAX_HOT_IDLE", 4, minimum=0),
+        max_executing=_runtime_env_int("HERMES_TUI_MAX_EXECUTING", 2, minimum=1),
+        idle_ttl_s=_runtime_env_float("HERMES_TUI_RUNTIME_IDLE_TTL_S", 900.0),
+        rss_soft_limit_bytes=(
+            _runtime_env_int("HERMES_TUI_RUNTIME_RSS_SOFT_LIMIT_BYTES", 0, minimum=0)
+            or None
+        ),
+        rss_eviction_batch=_runtime_env_int(
+            "HERMES_TUI_RUNTIME_RSS_EVICTION_BATCH", 2, minimum=1
+        ),
+    ),
+    cleanup=lambda sid, resources: _hibernate_runtime_resources(sid, resources),
+    rss_probe=_runtime_rss_bytes,
+)
 try:
     _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
 except (ValueError, TypeError):
@@ -225,6 +274,7 @@ _LONG_HANDLERS = frozenset(
         "session.branch",
         "session.compress",
         "session.list",
+        "session.read",
         "session.resume",
         "shell.exec",
         "skills.manage",
@@ -270,6 +320,16 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
+_subscription_hub = SubscriptionHub()
+
+
+def _subscription_scope(profile_home: str | Path | None = None) -> str:
+    home = Path(profile_home) if profile_home else Path(get_hermes_home())
+    return os.path.normcase(os.path.abspath(str(home)))
+
+
+def _disconnect_subscription_sink(sink: Any) -> int:
+    return _subscription_hub.disconnect(sink)
 
 
 class _SlashWorker:
@@ -638,6 +698,163 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
     # finalize is unregistering the notifier and closing the in-process agent.
 
 
+def _hibernate_runtime_resources(sid: str, resources: dict[str, Any]) -> None:
+    """Release one detached generation without ending the conversation.
+
+    The manager removes these exact resource objects from the live mapping while
+    holding its lock.  Cleanup must therefore never mutate the mapping: a new
+    generation may already be building by the time this callback runs.
+    """
+    stop_event = resources.get("_notif_stop")
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+
+    worker = resources.get("slash_worker")
+    if worker is not None:
+        try:
+            worker.close()
+        except Exception:
+            pass
+
+    agent = resources.get("agent")
+    if agent is not None and hasattr(agent, "release_clients"):
+        try:
+            agent.release_clients()
+        except Exception:
+            logger.debug("runtime client release failed sid=%s", sid, exc_info=True)
+
+
+def _register_managed_runtime(sid: str, session: dict) -> None:
+    """Idempotently attach an existing live-session record to the pool."""
+    try:
+        _runtime_manager.state(sid)
+    except KeyError:
+        _runtime_manager.register(sid, session)
+
+
+def _adopt_eager_runtime(sid: str, session: dict) -> None:
+    """Register an already-materialized eager session as hot-idle.
+
+    Eager paths (``_init_session``, branch/resume eager) build the agent and
+    worker inline before the session record is published.  This folds that
+    pre-existing materialization into the pool as HOT_IDLE so hibernation and
+    execution limits can govern it, without re-running any build.
+    """
+    _register_managed_runtime(sid, session)
+    if _runtime_manager.state(sid) is not RuntimeState.COLD:
+        return
+    build = _runtime_manager.acquire_build(sid)
+    _runtime_manager.finish_build(
+        sid,
+        build.generation,
+        agent=session.get("agent"),
+        slash_worker=session.get("slash_worker"),
+    )
+
+
+def _dispose_unattached_runtime(agent: Any, worker: Any) -> None:
+    if worker is not None:
+        try:
+            worker.close()
+        except Exception:
+            pass
+    if agent is not None and hasattr(agent, "release_clients"):
+        try:
+            agent.release_clients()
+        except Exception:
+            pass
+
+
+def _finish_runtime_build(
+    sid: str,
+    session: dict,
+    *,
+    generation: int,
+    agent: Any,
+    worker: Any,
+) -> bool:
+    """Attach one completed build only if its generation still owns the slot."""
+    attached = _runtime_manager.finish_build(
+        sid,
+        generation,
+        agent=agent,
+        slash_worker=worker,
+    )
+    if attached:
+        # finish_build may enforce the hot-idle cap synchronously. If this build
+        # was the eviction victim (for example max_hot_idle=0), cleanup already
+        # ran and callers must not continue wiring callbacks onto the cold agent.
+        with _sessions_lock:
+            return _sessions.get(sid) is session and session.get("agent") is agent
+
+    _dispose_unattached_runtime(agent, worker)
+    return False
+
+
+def _finish_runtime_build_for_execution(
+    sid: str,
+    session: dict,
+    *,
+    generation: int,
+    agent: Any,
+    worker: Any,
+):
+    """Atomically publish a first build and reserve its execution slot."""
+    try:
+        execution = _runtime_manager.finish_build_and_acquire_execution(
+            sid,
+            generation,
+            agent=agent,
+            slash_worker=worker,
+        )
+    except ExecutionCapacityExceeded:
+        _dispose_unattached_runtime(agent, worker)
+        raise
+    if execution is None:
+        _dispose_unattached_runtime(agent, worker)
+        return None
+    with _sessions_lock:
+        still_current = _sessions.get(sid) is session and session.get("agent") is agent
+    if not still_current:
+        execution.release()
+        _dispose_unattached_runtime(agent, worker)
+        return None
+    return execution
+
+
+def _acquire_runtime_execution(sid: str, session: dict):
+    """Acquire the global execution slot, adopting legacy hot records safely."""
+    _register_managed_runtime(sid, session)
+    state = _runtime_manager.state(sid)
+    if state is RuntimeState.COLD:
+        agent = session.get("agent")
+        if agent is None:
+            raise RuntimeError(f"runtime is cold: {sid}")
+        # Atomic adopt+execute: never expose a transient HOT_IDLE window that
+        # the hot-idle cap could hibernate (finish_build → acquire_execution has
+        # exactly that race when max_hot_idle is small).
+        build = _runtime_manager.acquire_build(sid)
+        return _runtime_manager.finish_build_and_acquire_execution(
+            sid,
+            build.generation,
+            agent=agent,
+            slash_worker=session.get("slash_worker"),
+        )
+    return _runtime_manager.acquire_execution(sid)
+
+
+def _take_runtime_execution(sid: str, session: dict):
+    """Consume an atomic build handoff or acquire a slot for an already-hot runtime."""
+    with session["history_lock"]:
+        execution = session.pop("_runtime_execution_lease", None)
+    if execution is not None and not execution.released:
+        return execution
+    return _acquire_runtime_execution(sid, session)
+
+
 def _attach_worker(sid: str, session: dict, worker) -> None:
     """Store worker on session iff sid still maps to it, else close it — a
     concurrent teardown already popped the session and would orphan the
@@ -659,6 +876,14 @@ def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
         session = _sessions.pop(sid, None)
     if session is None:
         return False
+    # Fence the runtime slot before terminal teardown so a late build/execution
+    # lease can no longer attach resources or re-enter the pool. ``discard``
+    # intentionally leaves resources on the popped session for _teardown_session
+    # to close/finalize destructively.
+    try:
+        _runtime_manager.discard(sid)
+    except KeyError:
+        pass
     _teardown_session(session, end_reason=end_reason)
     return True
 
@@ -1058,7 +1283,29 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     params = {"type": event, "session_id": sid}
     if payload is not None:
         params["payload"] = payload
-    write_json({"jsonrpc": "2.0", "method": "event", "params": params})
+    frame = {"jsonrpc": "2.0", "method": "event", "params": params}
+
+    with _sessions_lock:
+        session = _sessions.get(sid)
+        if session is None:
+            write_json(frame)
+            return
+        conversation_id = str(session.get("session_key") or sid)
+        profile_home = session.get("profile_home")
+        owner = session.get("transport")
+    if owner is None:
+        write_json(frame)
+    try:
+        _subscription_hub.publish(
+            _subscription_scope(profile_home),
+            conversation_id,
+            frame,
+            synchronous_sink=owner,
+        )
+    except RuntimeError:
+        logger.debug("subscription hub is closed; dropping fan-out")
+        if owner is not None:
+            owner.write(frame)
 
 
 def _emit_approval_request(sid: str, data: dict | None) -> None:
@@ -1214,7 +1461,12 @@ def _wait_agent(session: dict, rid: str, timeout: float = 30.0) -> dict | None:
     return _err(rid, 5032, err) if err else None
 
 
-def _start_agent_build(sid: str, session: dict) -> None:
+def _start_agent_build(
+    sid: str,
+    session: dict,
+    *,
+    execution_requested: bool = False,
+) -> None:
     """Start building the real AIAgent for a TUI session, once.
 
     Classic `hermes` shows the prompt before constructing AIAgent; the TUI used
@@ -1224,9 +1476,6 @@ def _start_agent_build(sid: str, session: dict) -> None:
     command that actually needs the agent), while retaining the same ready/error
     event contract for the frontend.
     """
-    ready = session.get("agent_ready")
-    if ready is None:
-        return
     # A lazy watch session spectating an in-flight child must stay lazy so the
     # subagent live-mirror keeps flowing. Incidental RPCs (session.info, model
     # metadata, etc.) resolve through _sess(), which would otherwise upgrade it
@@ -1237,7 +1486,36 @@ def _start_agent_build(sid: str, session: dict) -> None:
         return
     lock = session.setdefault("agent_build_lock", threading.Lock())
     with lock:
+        _register_managed_runtime(sid, session)
+        runtime_state = _runtime_manager.state(sid)
+        if (
+            runtime_state is RuntimeState.COLD
+            and session.get("agent") is None
+            and "agent_ready" in session
+        ):
+            # Hibernation intentionally detaches only expensive resources. Reset
+            # the legacy build controls here, under the single-flight lock, so a
+            # request racing cleanup can rematerialize without stale-ready reuse.
+            # Only touch sessions that already carry build controls: a bare lazy
+            # registration with no ``agent_ready`` key must keep the original
+            # "not buildable yet" contract (ready is None -> return below).
+            session["agent_ready"] = threading.Event()
+            session["agent_error"] = None
+            session["agent_build_started"] = False
+        ready = session.get("agent_ready")
+        if ready is None:
+            return
+        if execution_requested and runtime_state in {
+            RuntimeState.COLD,
+            RuntimeState.BUILDING,
+        }:
+            session["_runtime_execution_requested"] = True
         if ready.is_set() or session.get("agent_build_started"):
+            return
+        try:
+            build_lease = _runtime_manager.acquire_build(sid)
+        except RuntimeError:
+            # Another caller already owns the build, or the runtime is hot.
             return
         session["agent_build_started"] = True
         # An upgrading lazy session is now genuinely mid-construction — restore
@@ -1246,9 +1524,11 @@ def _start_agent_build(sid: str, session: dict) -> None:
     key = session["session_key"]
 
     def _build() -> None:
+        build_attached = False
         with _sessions_lock:
             current = _sessions.get(sid)
         if current is None:
+            build_lease.release()
             ready.set()
             return
 
@@ -1299,11 +1579,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
             finally:
                 _clear_session_context(tokens)
 
-            # Session DB row deferred to first run_conversation() call.
-            # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
-            # Baseline for the per-turn config sync; the profile home
-            # override is still active here.
+            # Build resources off-record, then attach both atomically through the
+            # runtime generation fence.  A build invalidated by hibernation or
+            # close can therefore never resurrect its agent or slash worker.
             current["config_model_seen"] = _config_model_target()
 
             try:
@@ -1312,9 +1590,33 @@ def _start_agent_build(sid: str, session: dict) -> None:
                     getattr(agent, "model", _resolve_model()),
                     profile_home=current.get("profile_home"),
                 )
-                _attach_worker(sid, current, worker)
             except Exception:
-                pass
+                worker = None
+
+            execution_requested_now = bool(
+                current.pop("_runtime_execution_requested", False)
+            )
+            if execution_requested_now:
+                execution_lease = _finish_runtime_build_for_execution(
+                    sid,
+                    current,
+                    generation=build_lease.generation,
+                    agent=agent,
+                    worker=worker,
+                )
+                build_attached = execution_lease is not None
+                if execution_lease is not None:
+                    current["_runtime_execution_lease"] = execution_lease
+            else:
+                build_attached = _finish_runtime_build(
+                    sid,
+                    current,
+                    generation=build_lease.generation,
+                    agent=agent,
+                    worker=worker,
+                )
+            if not build_attached:
+                return
 
             try:
                 from tools.approval import (
@@ -1354,8 +1656,15 @@ def _start_agent_build(sid: str, session: dict) -> None:
             except Exception:
                 pass
             with _sessions_lock:
-                if sid in _sessions:
-                    _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+                still_live = _sessions.get(sid) is current
+            if still_live:
+                poller_stop = _start_notification_poller(sid, current)
+                if not _runtime_manager.attach_resources(
+                    sid,
+                    build_lease.generation,
+                    _notif_stop=poller_stop,
+                ):
+                    poller_stop.set()
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent, current)
@@ -1373,6 +1682,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            build_lease.release()
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             # _attach_worker already closed the worker if this session was
@@ -4508,6 +4818,7 @@ def _init_session(
             "transport": current_transport() or _stdio_transport,
         }
     db = session_db if session_db is not None else _get_db()
+    _register_managed_runtime(sid, _sessions[sid])
     if db is not None:
         row = db.get_session(key)
         if row and row.get("cwd"):
@@ -4564,6 +4875,9 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+    # Eager sessions are already materialized — fold them into the pool as
+    # hot-idle (attach agent + worker) so hibernation/limits can govern them.
+    _adopt_eager_runtime(sid, _sessions[sid])
     _notify_session_boundary("on_session_reset", key)
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
@@ -5049,8 +5363,7 @@ def _(rid, params: dict) -> dict:
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
 
-    with _sessions_lock:
-        _sessions[sid] = {
+    record = {
             "agent": None,
             "agent_error": None,
             "agent_ready": ready,
@@ -5083,7 +5396,10 @@ def _(rid, params: dict) -> dict:
             "tool_started_at": {},
             "transport": current_transport() or _stdio_transport,
         }
-        _register_session_cwd(_sessions[sid])
+    with _sessions_lock:
+        _sessions[sid] = record
+        _register_managed_runtime(sid, record)
+        _register_session_cwd(record)
 
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
@@ -5177,6 +5493,456 @@ def _(rid, params: dict) -> dict:
         )
     except Exception as e:
         return _err(rid, 5006, str(e))
+
+
+@method("session.read")
+def _(rid, params: dict) -> dict:
+    """Read persisted conversation history without creating a live runtime.
+
+    The public id may be any physical alias in a compression lineage. Reads use
+    stable keyset cursors and explicit ``dialog``/``timeline`` projections.
+    """
+    conversation_id = str(
+        params.get("conversation_id") or params.get("session_id") or ""
+    ).strip()
+    if not conversation_id:
+        return _err(rid, 4006, "conversation_id required")
+
+    profile = str(params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    owns_db = profile_home is not None
+    db = None
+    try:
+        if owns_db:
+            from hermes_state import SessionDB
+
+            db = SessionDB(db_path=profile_home / "state.db")
+        else:
+            db = _get_db()
+        if db is None:
+            return _db_unavailable_error(rid, code=5006)
+
+        from tui_gateway.session_catalog import (
+            ConversationNotFound,
+            InvalidHistoryCursor,
+            PageItemTooLarge,
+            SessionCatalog,
+        )
+
+        try:
+            result = SessionCatalog(
+                db,
+                scope=profile or _current_profile_name(),
+            ).read(
+                conversation_id,
+                cursor=params.get("cursor") or None,
+                limit=params.get("limit", 50),
+                byte_limit=params.get("byte_limit", 512 * 1024),
+                view=str(params.get("view") or "dialog"),
+            )
+        except ConversationNotFound:
+            return _err(rid, 4007, "conversation not found")
+        except InvalidHistoryCursor as exc:
+            return _err(rid, 4008, str(exc))
+        except PageItemTooLarge as exc:
+            return _err(rid, 4130, str(exc))
+        except (TypeError, ValueError) as exc:
+            return _err(rid, 4009, str(exc))
+        return _ok(rid, result)
+    except Exception as exc:
+        logger.exception("session.read failed conversation_id=%s", conversation_id)
+        return _err(rid, 5006, f"session.read failed: {exc}")
+    finally:
+        if owns_db and db is not None:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+@method("session.watch")
+def _(rid, params: dict) -> dict:
+    """Observe a durable conversation without materializing its runtime."""
+    conversation_alias = str(
+        params.get("conversation_id") or params.get("session_id") or ""
+    ).strip()
+    if not conversation_alias:
+        return _err(rid, 4006, "conversation_id required")
+    sink = current_transport()
+    if sink is None:
+        return _err(rid, 4004, "session.watch requires a connection transport")
+
+    profile = str(params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    db, owns_db = _turn_db(profile)
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        try:
+            conversation_id, _tip_session_id, _lineage = db.resolve_conversation_lineage(
+                conversation_alias
+            )
+        except KeyError:
+            return _err(rid, 4007, "conversation not found")
+
+        cursor = params.get("cursor")
+        if cursor is not None and not isinstance(cursor, dict):
+            return _err(rid, 4009, "cursor must be an object")
+        try:
+            result = _subscription_hub.watch(
+                _subscription_scope(profile_home),
+                conversation_id,
+                sink,
+                cursor=cursor,
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            return _err(rid, 4009, f"invalid event cursor: {exc}")
+        result["conversation_id"] = conversation_id
+        return _ok(rid, result)
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+@method("session.unwatch")
+def _(rid, params: dict) -> dict:
+    """Stop observing one conversation; repeated calls are idempotent."""
+    conversation_alias = str(
+        params.get("conversation_id") or params.get("session_id") or ""
+    ).strip()
+    if not conversation_alias:
+        return _err(rid, 4006, "conversation_id required")
+    sink = current_transport()
+    if sink is None:
+        return _err(rid, 4004, "session.unwatch requires a connection transport")
+
+    profile = str(params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    db, owns_db = _turn_db(profile)
+    if db is None:
+        return _db_unavailable_error(rid, code=5006)
+    try:
+        try:
+            conversation_id, _tip_session_id, _lineage = db.resolve_conversation_lineage(
+                conversation_alias
+            )
+        except KeyError:
+            return _err(rid, 4007, "conversation not found")
+        removed = _subscription_hub.unwatch(
+            _subscription_scope(profile_home), conversation_id, sink
+        )
+        return _ok(
+            rid,
+            {"conversation_id": conversation_id, "watching": False, "removed": removed},
+        )
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+_DURABLE_TURN_WRITER_ID = f"gateway-{uuid.uuid4().hex}"
+
+
+def _current_process_started_at() -> float | None:
+    try:
+        import psutil
+
+        return float(psutil.Process(os.getpid()).create_time())
+    except Exception:
+        return None
+
+
+_DURABLE_TURN_PROCESS_STARTED_AT = _current_process_started_at()
+
+
+def _durable_turn_writer_alive(writer) -> bool:
+    """Conservative PID + process-birth probe used only for crash recovery."""
+    if writer.pid is None or writer.process_started_at is None:
+        return True
+    try:
+        import psutil
+
+        process = psutil.Process(writer.pid)
+        return abs(float(process.create_time()) - writer.process_started_at) < 1.0
+    except ImportError:
+        if writer.pid == os.getpid():
+            return (
+                _DURABLE_TURN_PROCESS_STARTED_AT is None
+                or abs(_DURABLE_TURN_PROCESS_STARTED_AT - writer.process_started_at) < 1.0
+            )
+        try:
+            os.kill(writer.pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except (PermissionError, OSError):
+            return True
+    except Exception as exc:
+        if exc.__class__.__name__ == "NoSuchProcess":
+            return False
+        return True
+
+
+def _new_turn_ledger(db):
+    from tui_gateway.turn_ledger import TurnLedger
+
+    return TurnLedger(
+        db,
+        writer_id=_DURABLE_TURN_WRITER_ID,
+        process_started_at=_DURABLE_TURN_PROCESS_STARTED_AT,
+        is_writer_alive=_durable_turn_writer_alive,
+    )
+
+
+def _turn_receipt_payload(receipt, *, deduplicated: bool | None = None) -> dict:
+    payload = {
+        "turn_id": receipt.turn_id,
+        "conversation_id": receipt.conversation_id,
+        "client_turn_id": receipt.client_turn_id,
+        "tip_session_id": receipt.tip_session_id,
+        "state": receipt.state.value,
+        "accepted_at": receipt.accepted_at,
+        "started_at": receipt.started_at,
+        "updated_at": receipt.updated_at,
+        "completed_at": receipt.completed_at,
+        "error_code": receipt.error_code,
+        "error_detail": receipt.error_detail,
+        "terminal_message_id": receipt.terminal_message_id,
+    }
+    if deduplicated is not None:
+        payload["deduplicated"] = deduplicated
+    return payload
+
+
+def _schedule_durable_turn(callback) -> None:
+    thread = threading.Thread(target=callback, daemon=True, name="durable-turn-dispatch")
+    thread.start()
+
+
+def _turn_db(profile: str | None):
+    profile_home = _profile_home(profile)
+    if profile_home is None:
+        return _get_db(), False
+    from hermes_state import SessionDB
+
+    return SessionDB(db_path=profile_home / "state.db"), True
+
+
+def _execute_durable_turn(
+    receipt,
+    fence,
+    ledger,
+    text: str,
+    *,
+    profile: str | None,
+    transport: Transport | None,
+) -> None:
+    live = _find_live_session_by_key(receipt.tip_session_id)
+    if live is None:
+        resume_response = _methods["session.resume"](
+            f"durable-resume-{receipt.turn_id}",
+            {
+                "session_id": receipt.tip_session_id,
+                "profile": profile,
+                "source": "turn-v2",
+            },
+        )
+        if "error" in resume_response:
+            raise RuntimeError(resume_response["error"].get("message", "resume failed"))
+        sid = str(resume_response["result"]["session_id"])
+        session = _sessions.get(sid)
+        if session is None:
+            raise RuntimeError("resumed runtime was not registered")
+    else:
+        sid, session = live
+
+    with session["history_lock"]:
+        if session.get("running"):
+            raise RuntimeError("live runtime is already executing")
+        if transport is not None:
+            session["transport"] = transport
+        session["running"] = True
+        session["_turn_cancel_requested"] = False
+        session["last_active"] = time.time()
+        _start_inflight_turn(session, text)
+
+    try:
+        _start_agent_build(sid, session, execution_requested=True)
+        wait_error = _wait_agent(session, receipt.turn_id)
+        if wait_error is not None:
+            raise RuntimeError(
+                wait_error.get("error", {}).get("message", "agent initialization failed")
+            )
+        runtime_execution = _take_runtime_execution(sid, session)
+        if not ledger.is_current(fence):
+            runtime_execution.release()
+            raise RuntimeError("durable turn writer fence became stale before execution")
+        ledger.mark_running(fence)
+        run_thread = _run_prompt_submit(
+            receipt.turn_id,
+            sid,
+            session,
+            text,
+            durable_turn=(ledger, receipt, fence),
+            runtime_execution=runtime_execution,
+        )
+        if isinstance(run_thread, threading.Thread):
+            run_thread.join()
+    except Exception:
+        with session["history_lock"]:
+            session["running"] = False
+            _clear_inflight_turn(session)
+        raise
+
+
+def _run_durable_turn_dispatch(
+    turn_id: str,
+    text: str,
+    *,
+    profile: str | None,
+    transport: Transport | None,
+) -> None:
+    db, owns_db = _turn_db(profile)
+    if db is None:
+        return
+    try:
+        from tui_gateway.turn_ledger import StaleWriterFence
+
+        ledger = _new_turn_ledger(db)
+        claimed = ledger.claim_start(turn_id)
+        if claimed is None:
+            return
+        receipt, fence = claimed
+        try:
+            _execute_durable_turn(
+                receipt,
+                fence,
+                ledger,
+                text,
+                profile=profile,
+                transport=transport,
+            )
+        except Exception as exc:
+            logger.exception("durable turn execution failed turn_id=%s", turn_id)
+            with contextlib.suppress(StaleWriterFence):
+                ledger.fail(fence, code="EXECUTION_FAILED", detail=str(exc))
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+@method("turn.submit")
+def _(rid, params: dict) -> dict:
+    import hashlib
+
+    conversation_alias = str(
+        params.get("conversation_id") or params.get("session_id") or ""
+    ).strip()
+    client_turn_id = str(params.get("client_turn_id") or "").strip()
+    text = params.get("text")
+    if not conversation_alias:
+        return _err(rid, 4006, "conversation_id required")
+    try:
+        uuid.UUID(client_turn_id)
+    except (ValueError, TypeError, AttributeError):
+        return _err(rid, 4004, "client_turn_id must be a UUID")
+    if not isinstance(text, str) or not text.strip():
+        return _err(rid, 4004, "text required")
+    if str(params.get("busy_policy") or "reject") != "reject":
+        return _err(rid, 4004, "busy_policy must be 'reject'")
+
+    profile = str(params.get("profile") or "").strip() or None
+    db, owns_db = _turn_db(profile)
+    if db is None:
+        return _db_unavailable_error(rid, code=5007)
+    try:
+        try:
+            conversation_id, tip_session_id, _lineage = db.resolve_conversation_lineage(
+                conversation_alias
+            )
+        except KeyError:
+            return _err(rid, 4007, "conversation not found")
+
+        from tui_gateway.turn_ledger import (
+            ConversationBusy,
+            IdempotencyConflict,
+        )
+
+        request_hash = "sha256:" + hashlib.sha256(
+            json.dumps(
+                {"text": text, "busy_policy": "reject"},
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()
+        ledger = _new_turn_ledger(db)
+        ledger.recover()
+        try:
+            accepted = ledger.accept(
+                conversation_id,
+                tip_session_id,
+                client_turn_id,
+                request_hash,
+            )
+        except IdempotencyConflict as exc:
+            return _err(rid, 4091, f"idempotency conflict for turn {exc.receipt.turn_id}")
+        except ConversationBusy as exc:
+            return _err(rid, 4092, f"conversation busy with turn {exc.receipt.turn_id}")
+
+        receipt = accepted.receipt
+        if receipt.state.value == "ACCEPTED":
+            transport = current_transport()
+            try:
+                _schedule_durable_turn(
+                    lambda: _run_durable_turn_dispatch(
+                        receipt.turn_id,
+                        text,
+                        profile=profile,
+                        transport=transport,
+                    )
+                )
+            except Exception as dispatch_exc:
+                claimed = ledger.claim_start(receipt.turn_id)
+                if claimed is not None:
+                    _starting, fence = claimed
+                    receipt = ledger.fail(
+                        fence,
+                        code="DISPATCH_FAILED",
+                        detail=str(dispatch_exc),
+                    )
+        return _ok(
+            rid,
+            _turn_receipt_payload(receipt, deduplicated=accepted.deduplicated),
+        )
+    except Exception as exc:
+        logger.exception("turn.submit failed conversation_id=%s", conversation_alias)
+        return _err(rid, 5007, f"turn.submit failed: {exc}")
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
+
+
+@method("turn.status")
+def _(rid, params: dict) -> dict:
+    turn_id = str(params.get("turn_id") or "").strip()
+    if not turn_id:
+        return _err(rid, 4006, "turn_id required")
+    profile = str(params.get("profile") or "").strip() or None
+    db, owns_db = _turn_db(profile)
+    if db is None:
+        return _db_unavailable_error(rid, code=5007)
+    try:
+        receipt = _new_turn_ledger(db).get(turn_id)
+        if receipt is None:
+            return _err(rid, 4007, "turn not found")
+        return _ok(rid, _turn_receipt_payload(receipt))
+    finally:
+        if owns_db:
+            with contextlib.suppress(Exception):
+                db.close()
 
 
 @method("session.most_recent")
@@ -5351,7 +6117,8 @@ def _claim_or_reuse_live(
             return live
         with _sessions_lock:
             _sessions[sid] = record
-            _register_session_cwd(_sessions[sid])
+            _register_managed_runtime(sid, record)
+            _register_session_cwd(record)
     return None
 
 
@@ -8291,7 +9058,7 @@ def _(rid, params: dict) -> dict:
     # A branch becomes real here: copy its parent's transcript into the row so it
     # resumes with full context (the agent won't persist the seed itself).
     _persist_branch_seed(session)
-    _start_agent_build(sid, session)
+    _start_agent_build(sid, session, execution_requested=True)
 
     def run_after_agent_ready() -> None:
         err = _wait_agent(session, rid)
@@ -8311,10 +9078,34 @@ def _(rid, params: dict) -> dict:
             return
         with session["history_lock"]:
             if session.get("_turn_cancel_requested") or not session.get("running"):
+                pending_execution = session.pop("_runtime_execution_lease", None)
+                if pending_execution is not None:
+                    pending_execution.release()
                 session["running"] = False
                 _clear_inflight_turn(session)
                 return
-        _run_prompt_submit(rid, sid, session, text)
+        try:
+            runtime_execution = _take_runtime_execution(sid, session)
+        except ExecutionCapacityExceeded:
+            _emit(
+                "error",
+                sid,
+                {
+                    "code": "RUNTIME_CAPACITY_EXCEEDED",
+                    "message": "runtime execution capacity is exhausted",
+                },
+            )
+            with session["history_lock"]:
+                session["running"] = False
+                _clear_inflight_turn(session)
+            return
+        _run_prompt_submit(
+            rid,
+            sid,
+            session,
+            text,
+            runtime_execution=runtime_execution,
+        )
 
     run_thread = threading.Thread(target=run_after_agent_ready, daemon=True)
     # Keep a handle so session.interrupt can tell a live turn from a stuck
@@ -8566,7 +9357,16 @@ def _start_notification_poller(sid: str, session: dict) -> threading.Event:
     return stop
 
 
-def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
+def _run_prompt_submit(
+    rid,
+    sid: str,
+    session: dict,
+    text: Any,
+    *,
+    durable_turn=None,
+    runtime_execution=None,
+) -> threading.Thread:
+    durable_terminal = False
     with session["history_lock"]:
         history = list(session["history"])
         history_version = int(session.get("history_version", 0))
@@ -8581,8 +9381,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         except Exception:
             pass
     _emit("message.start", sid)
+    if runtime_execution is None:
+        runtime_execution = _take_runtime_execution(sid, session)
 
     def run():
+        nonlocal durable_terminal
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -8632,13 +9435,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
+                    message = "\n".join(ctx.warnings) or "Context injection refused."
+                    if durable_turn is not None:
+                        durable_ledger, _durable_receipt, durable_fence = durable_turn
+                        durable_ledger.fail(
+                            durable_fence,
+                            code="CONTEXT_BLOCKED",
+                            detail=message,
+                        )
+                        durable_terminal = True
                     _emit(
                         "error",
                         sid,
-                        {
-                            "message": "\n".join(ctx.warnings)
-                            or "Context injection refused."
-                        },
+                        {"message": message},
                     )
                     return
                 prompt = ctx.message
@@ -8832,6 +9641,29 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            if durable_turn is not None:
+                durable_ledger, _durable_receipt, durable_fence = durable_turn
+                if status == "complete":
+                    durable_ledger.succeed(
+                        durable_fence,
+                        tip_session_id=str(session.get("session_key") or sid),
+                    )
+                elif status == "interrupted":
+                    durable_ledger.interrupt(
+                        durable_fence,
+                        detail=str(result.get("error") or "interrupted")
+                        if isinstance(result, dict)
+                        else "interrupted",
+                    )
+                else:
+                    durable_ledger.fail(
+                        durable_fence,
+                        code="AGENT_ERROR",
+                        detail=str(result.get("error") or raw or "agent error")
+                        if isinstance(result, dict)
+                        else str(raw or "agent error"),
+                    )
+                durable_terminal = True
             with session["history_lock"]:
                 _clear_inflight_turn(session)
             _emit("message.complete", sid, payload)
@@ -8960,6 +9792,21 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         except Exception as e:
             import traceback
 
+            if durable_turn is not None and not durable_terminal:
+                from tui_gateway.turn_ledger import StaleWriterFence
+
+                durable_ledger, _durable_receipt, durable_fence = durable_turn
+                try:
+                    durable_ledger.fail(
+                        durable_fence,
+                        code="EXECUTION_FAILED",
+                        detail=str(e),
+                    )
+                    durable_terminal = True
+                except StaleWriterFence:
+                    durable_terminal = True
+                    return
+
             trace = traceback.format_exc()
             try:
                 os.makedirs(os.path.dirname(_CRASH_LOG), exist_ok=True)
@@ -8984,6 +9831,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             _clear_session_context(session_tokens)
+            if runtime_execution is not None:
+                runtime_execution.release()
             with session["history_lock"]:
                 session["running"] = False
                 session["last_active"] = time.time()
@@ -9053,7 +9902,12 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
     run_thread = threading.Thread(target=run, daemon=True)
     session["_run_thread"] = run_thread
-    run_thread.start()
+    try:
+        run_thread.start()
+    except Exception:
+        runtime_execution.release()
+        raise
+    return run_thread
 
 
 @method("clipboard.paste")

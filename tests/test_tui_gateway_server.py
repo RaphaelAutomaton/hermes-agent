@@ -16,6 +16,38 @@ from hermes_cli.active_sessions import active_session_registry_snapshot
 from tui_gateway import server
 
 
+@pytest.fixture(autouse=True)
+def _fresh_runtime_manager():
+    """Reset the module-global SessionRuntimeManager between tests.
+
+    ``prompt.submit`` and the session lifecycle now route through this
+    singleton, and tests in this file reuse the sid ``"sid"`` across many
+    functions. A ``CLOSED`` zombie left by one test would make the next test's
+    registration observe ``state() is CLOSED`` instead of a fresh COLD runtime,
+    so execution-lease acquisition would fail with "not hot and idle". Rebuild
+    the singleton per test to keep the file hermetic (see tests/conftest.py:
+    intra-file shared state is the author's responsibility to reset).
+    """
+    server._runtime_manager = server.SessionRuntimeManager(
+        server.RuntimePolicy(
+            max_hot_idle=server._runtime_env_int("HERMES_TUI_MAX_HOT_IDLE", 4, minimum=0),
+            max_executing=server._runtime_env_int("HERMES_TUI_MAX_EXECUTING", 2, minimum=1),
+            idle_ttl_s=server._runtime_env_float("HERMES_TUI_RUNTIME_IDLE_TTL_S", 900.0),
+            rss_soft_limit_bytes=(
+                server._runtime_env_int(
+                    "HERMES_TUI_RUNTIME_RSS_SOFT_LIMIT_BYTES", 0, minimum=0
+                )
+                or None
+            ),
+            rss_eviction_batch=server._runtime_env_int(
+                "HERMES_TUI_RUNTIME_RSS_EVICTION_BATCH", 2, minimum=1
+            ),
+        ),
+        cleanup=server._hibernate_runtime_resources,
+        rss_probe=server._runtime_rss_bytes,
+    )
+
+
 def test_session_create_rejects_at_active_session_limit(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -5190,7 +5222,7 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
-        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
+        monkeypatch.setattr(server, "_start_agent_build", lambda sid, session, **kwargs: None)
         monkeypatch.setattr(server, "_wait_agent", lambda session, rid: None)
         monkeypatch.setattr(
             server,

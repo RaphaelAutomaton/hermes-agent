@@ -32,6 +32,7 @@ import threading
 from typing import Any
 
 from tui_gateway import server
+from tui_gateway.protocol import gateway_ready_payload
 
 _log = logging.getLogger(__name__)
 
@@ -322,7 +323,7 @@ async def handle_ws(ws: Any) -> None:
                 "method": "event",
                 "params": {
                     "type": "gateway.ready",
-                    "payload": {"skin": server.resolve_skin()},
+                    "payload": gateway_ready_payload(server.resolve_skin()),
                 },
             }
         )
@@ -426,6 +427,10 @@ async def handle_ws(ws: Any) -> None:
         reaped_sessions = 0
         detached_sessions = 0
         if transport is not None:
+            try:
+                server._disconnect_subscription_sink(transport)
+            except Exception:
+                _log.exception("ws subscription teardown failed peer=%s", peer)
             transport.close()
 
             # Reap sessions this transport owned (close_on_disconnect sidecar

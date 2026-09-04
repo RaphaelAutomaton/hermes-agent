@@ -127,6 +127,19 @@ def test_ws_disconnect_preserves_and_repoints_reconnectable_session(monkeypatch)
         server._sessions.clear()
 
 
+def test_ws_disconnect_removes_all_event_subscriptions(monkeypatch):
+    disconnected = []
+    monkeypatch.setattr(
+        server,
+        "_disconnect_subscription_sink",
+        lambda sink: disconnected.append(sink) or 2,
+    )
+
+    _run_disconnect(monkeypatch, lambda _transport: None)
+
+    assert len(disconnected) == 1
+
+
 def test_ws_write_loop_stall_does_not_latch_transport(monkeypatch):
     """A write that times out because the event loop is stalled (GIL-heavy
     agent turn) must NOT latch the transport closed — the frame is already
