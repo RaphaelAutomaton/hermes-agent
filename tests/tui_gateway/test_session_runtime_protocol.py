@@ -51,7 +51,7 @@ def test_ready_payload_negotiates_only_implemented_v2_capabilities():
         "stable_snapshot": True,
         "durable_turns": True,
         "subscriptions": True,
-        "runtime_pool": False,
+        "runtime_pool": True,
     }
 
 

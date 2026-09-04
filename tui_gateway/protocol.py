@@ -14,7 +14,11 @@ SESSION_RUNTIME_CAPABILITIES = {
     # Advertise future cuts only when they are implemented end-to-end.
     "durable_turns": True,
     "subscriptions": True,
-    "runtime_pool": False,
+    # The server now runs a bounded Session Runtime Manager (max_hot_idle /
+    # max_executing / sweep TTL + RSS eviction / hibernation that preserves the
+    # durable conversation). Advertised only because the pool is live and
+    # limits runtime materialization regardless of client opt-in.
+    "runtime_pool": True,
 }
 
 

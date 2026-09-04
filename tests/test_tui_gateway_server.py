@@ -8812,3 +8812,178 @@ def test_get_usage_clamps_post_compression_sentinel():
     usage = server._get_usage(agent)
     assert "context_used" not in usage
     assert "context_percent" not in usage
+
+
+# ── Session Runtime Manager: hibernation preserves the durable conversation ──
+
+class _RecordingAgent:
+    """Fake AIAgent-like object that records lifecycle calls."""
+
+    def __init__(self):
+        self.release_count = 0
+        self.close_count = 0
+
+    def release_clients(self):
+        self.release_count += 1
+
+    def close(self):
+        self.close_count += 1
+
+
+class _RecordingWorker:
+    def __init__(self):
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
+def test_hibernate_releases_resources_but_preserves_conversation_for_rematerialization():
+    """Hibernating a hot runtime must detach only expensive clients (never
+    call `agent.close()`, which would end the conversation / clear history)
+    and must keep the durable identity + history on the session record so a
+    later submit can rematerialize under the exact same conversation.
+
+    This is the heart of the bounded-runtime invariant: reading never resumes,
+    observing never activates, and the runtime manager may drop clients to
+    reclaim RAM without losing the persisted conversation."""
+    from tui_gateway.session_runtime import RuntimeState
+    from tui_gateway.session_runtime import SessionRuntimeManager
+
+    # Build a dedicated manager wired to the real server cleanup so the test
+    # exercises _hibernate_runtime_resources end-to-end without sharing the
+    # module singleton across server tests.
+    from tui_gateway.session_runtime import RuntimePolicy
+    runtime = SessionRuntimeManager(
+        RuntimePolicy(max_hot_idle=4, max_executing=2),
+        cleanup=server._hibernate_runtime_resources,
+        rss_probe=server._runtime_rss_bytes,
+    )
+    session_key = "durable-conversation-key"
+    history = [
+        {"role": "user", "content": "round one"},
+        {"role": "assistant", "content": "round one reply"},
+    ]
+    agent = _RecordingAgent()
+    worker = _RecordingWorker()
+    session = {
+        "session_key": session_key,
+        "history": history,
+        "agent": agent,
+        "slash_worker": worker,
+        # Model/provider identity that _start_agent_build must keep across a
+        # rematerialization (stored as resume_runtime_overrides on a cold
+        # deferred resume).
+        "resume_runtime_overrides": {
+            "model_override": {"model": "vendor/cool-model", "provider": "vendor"},
+        },
+    }
+    session_id = "sid-remat"
+    try:
+        runtime.register(session_id, session)
+        build = runtime.acquire_build(session_id)
+        runtime.finish_build(
+            session_id,
+            build.generation,
+            agent=agent,
+            slash_worker=worker,
+        )
+        assert runtime.state(session_id) is RuntimeState.HOT_IDLE
+        assert session.get("agent") is agent
+
+        # Hibernate triggers the server cleanup callback but must return the
+        # runtime to COLD, not CLOSED, and without calling agent.close().
+        assert runtime.hibernate(session_id) is True
+        assert runtime.state(session_id) is RuntimeState.COLD
+
+        assert agent.release_count == 1, "hibernate should release clients once"
+        assert agent.close_count == 0, "hibernate must NEVER agent.close()"
+        assert worker.close_count == 1, "slash worker is cheap, close it to reap subprocess"
+        assert session_id in runtime.sessions
+
+        # The durable conversation identity survives the detach, enabling a
+        # clean rematerialization on the next submit. The runtime mapping is a
+        # separate dict from `session`; hibernation keeps `session` as COLD and
+        # removes the attached keys from it.
+        assert runtime.sessions[session_id]["history"] == history
+        assert runtime.sessions[session_id]["session_key"] == session_key
+        assert "resume_runtime_overrides" in runtime.sessions[session_id]
+        assert session.get("agent") is None or "agent" not in session
+
+        # Rematerialize: a fresh build re-attaches under the SAME session/identity.
+        build2 = runtime.acquire_build(session_id)
+        assert runtime.finish_build(
+            session_id,
+            build2.generation,
+            agent=object(),
+            slash_worker=object(),
+        ) is True
+        assert runtime.state(session_id) is RuntimeState.HOT_IDLE
+        assert runtime.sessions[session_id]["session_key"] == session_key
+        assert runtime.sessions[session_id]["history"] == history
+    finally:
+        runtime.sessions.clear()
+        runtime._runtimes.clear()
+        server._sessions.clear()
+
+
+def test_terminal_close_calls_agent_close_but_hibernation_does_not():
+    """Contrast: a true terminal close (runtime drop/teardown path that calls
+    _close_session_by_id -> discard then agent teardown) must end the agent.
+    The SessionRuntimeManager.close() path (distinct from hibernate) releases
+    the detached resources and may close them, and returns CLOSED refusing reuse."""
+    from tui_gateway.session_runtime import RuntimeClosed
+    from tui_gateway.session_runtime import RuntimePolicy
+    from tui_gateway.session_runtime import RuntimeState
+    from tui_gateway.session_runtime import SessionRuntimeManager
+
+    runtime = SessionRuntimeManager(
+        RuntimePolicy(max_hot_idle=4, max_executing=2),
+        cleanup=server._hibernate_runtime_resources,
+        rss_probe=server._runtime_rss_bytes,
+    )
+    session = {"_runtime_released": False}
+    session_id = "sid-term"
+    try:
+        runtime.register(session_id, session)
+        build = runtime.acquire_build(session_id)
+        runtime.finish_build(session_id, build.generation, agent="detached-agent")
+
+        assert runtime.close(session_id) is True
+        assert runtime.state(session_id) is RuntimeState.CLOSED
+        assert session_id not in runtime.sessions
+        # CLOSED runtime refuses reuse: further register raises.
+        with pytest.raises(RuntimeClosed):
+            runtime.register(session_id, {})
+    finally:
+        runtime.sessions.clear()
+        runtime._runtimes.clear()
+        server._sessions.clear()
+
+
+def test_discard_then_register_same_sid_is_rejected_and_keeps_cold_semantics():
+    """_close_session_by_id discards the runtime before teardown; a fresh
+    session.create on a NEW sid is a different runtime. Discard fences the old
+    identity (CLOSED) so a late build/execution can never attach."""
+    from tui_gateway.session_runtime import RuntimeClosed
+    from tui_gateway.session_runtime import RuntimeState
+    from tui_gateway.session_runtime import RuntimePolicy
+    from tui_gateway.session_runtime import SessionRuntimeManager
+
+    runtime = SessionRuntimeManager(
+        RuntimePolicy(max_hot_idle=4, max_executing=2),
+        cleanup=server._hibernate_runtime_resources,
+        rss_probe=server._runtime_rss_bytes,
+    )
+    session_id = "sid-discard"
+    try:
+        runtime.register(session_id, {"session_key": "dup"})
+        assert runtime.discard(session_id) is True
+        assert runtime.state(session_id) is RuntimeState.CLOSED
+        assert session_id not in runtime.sessions
+        with pytest.raises(RuntimeClosed):
+            runtime.register(session_id, {})
+    finally:
+        runtime.sessions.clear()
+        runtime._runtimes.clear()
+        server._sessions.clear()
