@@ -8987,3 +8987,55 @@ def test_discard_then_register_same_sid_is_rejected_and_keeps_cold_semantics():
         runtime.sessions.clear()
         runtime._runtimes.clear()
         server._sessions.clear()
+
+
+def test_session_status_includes_structured_usage_for_the_chat_usage_meter():
+    """session.status must return a structured `usage` object (not just the
+    plain-text `output`) carrying context_used/context_max/context_percent so
+    the Ariadne chat can paint a live context gauge. The text `output` is kept
+    for v1 clients.
+
+    Regression guard: this is the exact channel the bounded-context meter
+    relies on (heartbeat polls session.status every 15s); if the handler ever
+    stops exposing usage here, the gauge silently goes stale."""
+    agent = types.SimpleNamespace(
+        model="gpt-5.6",
+        provider="openai-codex",
+        session_total_tokens=4_000_000,
+        context_compressor=types.SimpleNamespace(
+            last_prompt_tokens=84_000,
+            context_length=120_000,
+            compression_count=3,
+        ),
+    )
+    s = {"session_key": "sid-usage", "agent": agent, "running": False}
+    server._sessions["sid-usage"] = s
+    try:
+        from unittest.mock import patch as _mp
+
+        with _mp.object(server, "_get_db", lambda: None):
+            resp = server._methods["session.status"](
+                "rid-usage", {"session_id": "sid-usage"}
+            )
+        assert "error" not in resp
+        result = resp["result"]
+        # Legacy plain-text surface preserved.
+        assert "output" in result
+        # New structured usage surface the Ariadne gauge reads.
+        assert result["usage"] == {
+            "model": "gpt-5.6",
+            "input": 0,
+            "output": 0,
+            "reasoning": 0,
+            "prompt": 0,
+            "completion": 0,
+            "total": 4_000_000,
+            "calls": 0,
+            "context_used": 84_000,
+            "context_max": 120_000,
+            "context_percent": 70,
+            "compressions": 3,
+            "active_subagents": 0,
+        }
+    finally:
+        server._sessions.pop("sid-usage", None)

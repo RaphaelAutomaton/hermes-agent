@@ -8406,7 +8406,18 @@ def _(rid, params: dict) -> dict:
             f"Agent Running: {'Yes' if session.get('running') else 'No'}",
         ]
     )
-    return _ok(rid, {"output": "\n".join(lines)})
+    return _ok(
+        rid,
+        {
+            # Legacy plain-text surface (parsed by some v1 clients / CLI).
+            "output": "\n".join(lines),
+            # Structured surface for the Ariadne chat usage/context gauge.
+            # Carries context_used/context_max/context_percent (when the agent
+            # has a live compressor reading) plus tokens totals. Additive; v1
+            # consumers reading the text output are unaffected.
+            "usage": usage,
+        },
+    )
 
 
 @method("session.history")
