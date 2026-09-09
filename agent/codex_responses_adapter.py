@@ -464,7 +464,18 @@ def _chat_messages_to_responses_input(
                         }
                         item_id = raw_item.get("id")
                         if isinstance(item_id, str) and item_id.strip():
-                            replay_item["id"] = item_id.strip()
+                            normalized_item_id = item_id.strip()
+                            # ChatGPT's Codex backend accepts replayed assistant
+                            # message IDs only in its native ``msg_...`` shape.
+                            # Other Responses-compatible providers may persist
+                            # UUIDs here; replay their content/phase but omit the
+                            # foreign cache reference when switching back to
+                            # Codex, otherwise the whole turn fails with HTTP 400.
+                            if (
+                                current_issuer_kind != "codex_backend"
+                                or normalized_item_id.startswith("msg_")
+                            ):
+                                replay_item["id"] = normalized_item_id
                         phase = raw_item.get("phase")
                         if isinstance(phase, str) and phase.strip():
                             replay_item["phase"] = phase.strip()

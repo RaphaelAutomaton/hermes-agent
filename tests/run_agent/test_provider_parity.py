@@ -913,6 +913,48 @@ class TestChatMessagesToResponsesInputMessageItems:
         assert msg_items[0]["phase"] == "final_answer"
         assert msg_items[0]["content"][0]["text"] == "Hello world"
 
+    def test_codex_backend_strips_foreign_uuid_message_item_id(self, monkeypatch):
+        """A provider-switched session must not poison Codex replay with a UUID.
+
+        ChatGPT's Codex backend only accepts assistant message item IDs that
+        begin with ``msg_``. Other Responses-compatible providers can mint UUID
+        IDs; preserve their content and phase, but omit that incompatible cache
+        reference when the session switches back to Codex.
+        """
+        agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
+                            base_url="https://chatgpt.com/backend-api/codex")
+        messages = [
+            {
+                "role": "assistant",
+                "content": "foreign fallback text",
+                "codex_message_items": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "id": "0d21c8a9-82fc-49a9-9c4d-826e7d4bf642",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "foreign output"}],
+                    },
+                ],
+            },
+        ]
+
+        items = _chat_messages_to_responses_input(
+            messages,
+            current_issuer_kind="codex_backend",
+        )
+
+        assert items == [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "foreign output"}],
+            },
+        ]
+
     def test_fallback_to_plain_when_no_message_items(self, monkeypatch):
         agent = _make_agent(monkeypatch, "openai-codex", api_mode="codex_responses",
                             base_url="https://chatgpt.com/backend-api/codex")
