@@ -1565,16 +1565,14 @@ def _start_agent_build(
                     # overrides splat did, so a deferred build can't drop the
                     # provider and fail with "No LLM provider configured".
                     kw.update(resume_overrides)
-                else:
-                    # Model/effort/fast the desktop picked for a brand-new chat
-                    # ride in as per-session overrides so the first build uses
-                    # them directly (no global config, no build-then-switch).
-                    if override := current.get("model_override"):
-                        kw["model_override"] = override
-                    if (reasoning := current.get("create_reasoning_override")) is not None:
-                        kw["reasoning_config_override"] = reasoning
-                    if (tier := current.get("create_service_tier_override")) is not None:
-                        kw["service_tier_override"] = tier
+                # New picks override restored defaults even before a deferred
+                # resume has materialized its agent.
+                if override := current.get("model_override"):
+                    kw["model_override"] = override
+                if (reasoning := current.get("create_reasoning_override")) is not None:
+                    kw["reasoning_config_override"] = reasoning
+                if (tier := current.get("create_service_tier_override")) is not None:
+                    kw["service_tier_override"] = tier
                 agent = _make_agent(sid, key, **kw)
             finally:
                 _clear_session_context(tokens)
@@ -2526,6 +2524,10 @@ def _runtime_model_config(agent, existing: dict | None = None) -> dict:
         config.pop("reasoning_config", None)
     if service_tier:
         config["service_tier"] = service_tier
+    elif hasattr(agent, "service_tier"):
+        # Missing means inherit on restore; explicit normal must survive a
+        # profile default changed to fast in another chat.
+        config["service_tier"] = "normal"
     else:
         config.pop("service_tier", None)
 
@@ -2538,7 +2540,7 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         return
     agent = session.get("agent")
     session_key = str(session.get("session_key") or "").strip()
-    if agent is None or not session_key:
+    if not session_key:
         return
 
     db = getattr(agent, "_session_db", None) or _get_db()
@@ -2555,8 +2557,20 @@ def _persist_live_session_runtime(session: dict | None) -> None:
             parsed = json.loads(raw_config)
             if isinstance(parsed, dict):
                 existing_config = parsed
-        model_config = _runtime_model_config(agent, existing_config)
-        model = str(getattr(agent, "model", "") or "").strip()
+        if agent is not None:
+            model_config = _runtime_model_config(agent, existing_config)
+            model = str(getattr(agent, "model", "") or "").strip()
+        else:
+            # Update an existing lazy/restored row only. Drafts remain drafts;
+            # first submit persists their staged controls in _ensure_session_db_row.
+            if not row:
+                return
+            model_config = dict(existing_config)
+            if (reasoning := session.get("create_reasoning_override")) is not None:
+                model_config["reasoning_config"] = reasoning
+            if (tier := session.get("create_service_tier_override")) is not None:
+                model_config["service_tier"] = tier
+            model = ""
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
         elif model and hasattr(db, "update_session_model"):
@@ -3483,6 +3497,55 @@ def _current_profile_name() -> str:
 DESKTOP_BACKEND_CONTRACT = 2
 
 
+def _session_model_controls(session: dict) -> dict:
+    """Snapshot desired controls and materialized runtime, without building it.
+
+    ``effective`` means the agent's local configuration, NOT proof that a remote
+    provider honored a parameter. Before construction it is unknown (None).
+    Flat fields retain the legacy shape: live runtime, or desired lazy values.
+    """
+    agent = session.get("agent")
+    resume = session.get("resume_runtime_overrides") or {}
+    override = session.get("model_override") or resume.get("model_override") or {}
+    if isinstance(override, str):
+        override = {"model": override}
+
+    def controls(model, provider, reasoning, tier):
+        effort = ""
+        if isinstance(reasoning, dict):
+            effort = "none" if reasoning.get("enabled") is False else str(reasoning.get("effort") or "")
+        return {
+            "model": model or "", "provider": provider or "",
+            "reasoning_effort": effort,
+            "service_tier": "" if tier in {None, "normal"} else tier,
+            "fast": tier == "priority",
+        }
+
+    reasoning = session.get("create_reasoning_override")
+    if reasoning is None:
+        reasoning = resume.get("reasoning_config_override")
+    if reasoning is None:
+        reasoning = getattr(agent, "reasoning_config", None) if agent is not None else _load_reasoning_config()
+    tier = session.get("create_service_tier_override")
+    if tier is None:
+        tier = resume.get("service_tier_override")
+    if tier is None:
+        tier = getattr(agent, "service_tier", None) if agent is not None else _load_service_tier()
+    requested = controls(
+        override.get("model") or getattr(agent, "model", "") or _resolve_model(),
+        override.get("provider") or getattr(agent, "provider", ""), reasoning, tier,
+    )
+    effective = None if agent is None else controls(
+        getattr(agent, "model", ""), getattr(agent, "provider", ""),
+        getattr(agent, "reasoning_config", None), getattr(agent, "service_tier", None),
+    )
+    return {
+        **(effective if effective is not None else requested),
+        "running": bool(session.get("running")),
+        "model_controls": {"requested": requested, "effective": effective},
+    }
+
+
 def _session_info(agent, session: dict | None = None) -> dict:
     if session is None:
         for candidate in _sessions.values():
@@ -3549,6 +3612,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "usage": _get_usage(agent),
         "profile_name": _current_profile_name(),
     }
+    # Share the same requested/effective contract as status and lazy replies.
+    info.update(_session_model_controls({**(session or {}), "agent": agent}))
     try:
         from hermes_cli import __version__, __release_date__
 
@@ -4471,6 +4536,12 @@ def _reset_session_agent(sid: str, session: dict) -> dict:
             old_reasoning = session.get("create_reasoning_override")
         if isinstance(old_reasoning, dict):
             reset_kw["reasoning_config_override"] = old_reasoning
+        old_agent = session.get("agent")
+        reset_kw["service_tier_override"] = (
+            (getattr(old_agent, "service_tier", None) or "normal")
+            if old_agent is not None
+            else session.get("create_service_tier_override")
+        )
         new_agent = _make_agent(
             sid,
             session["session_key"],
@@ -4730,6 +4801,22 @@ def _make_agent(
             "target_model": model or None,
         })
     _pr = _load_provider_routing()
+    # None inherits the profile; "normal" explicitly disables Fast. Native
+    # transports consume request_overrides, not the UI's service_tier marker.
+    service_tier = (
+        service_tier_override
+        if service_tier_override is not None
+        else _load_service_tier()
+    )
+    if service_tier == "normal":
+        service_tier = None
+    from hermes_cli.models import resolve_fast_mode_overrides
+
+    request_overrides = (
+        resolve_fast_mode_overrides(model) or {}
+        if service_tier == "priority"
+        else {}
+    )
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 90),
@@ -4751,11 +4838,8 @@ def _make_agent(
             if reasoning_config_override is not None
             else _load_reasoning_config()
         ),
-        service_tier=(
-            service_tier_override
-            if service_tier_override is not None
-            else _load_service_tier()
-        ),
+        service_tier=service_tier,
+        request_overrides=request_overrides,
         enabled_toolsets=_load_enabled_toolsets(),
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
@@ -5346,16 +5430,27 @@ def _(rid, params: dict) -> dict:
         else None
     )
     create_reasoning_override = None
-    if effort := str(params.get("reasoning_effort") or "").strip():
-        try:
-            from hermes_constants import parse_reasoning_effort
+    effort = params.get("reasoning_effort")
+    if effort is not None and not (isinstance(effort, str) and not effort.strip()):
+        from hermes_constants import parse_reasoning_effort
 
-            create_reasoning_override = parse_reasoning_effort(effort)
-        except Exception:
-            create_reasoning_override = None
-    # Only pin "fast" when explicitly requested; leaving it None lets the build
-    # fall back to the profile default service tier rather than forcing normal.
-    create_service_tier_override = "priority" if params.get("fast") else None
+        create_reasoning_override = parse_reasoning_effort(effort)
+        if create_reasoning_override is None:
+            return _err(rid, 4002, "invalid reasoning effort")
+    if "fast" in params:
+        if not isinstance(params["fast"], bool):
+            return _err(rid, 4002, "fast must be a boolean")
+        if params["fast"]:
+            from hermes_cli.models import resolve_fast_mode_overrides
+
+            target_model = create_model or _resolve_model()
+            if not target_model or resolve_fast_mode_overrides(target_model) is None:
+                return _err(rid, 4002, "fast mode is not available for this model")
+    # Absence inherits the profile; explicit false pins normal. _make_agent
+    # translates this persisted sentinel to None only after resolving defaults.
+    create_service_tier_override = (
+        ("priority" if params["fast"] else "normal") if "fast" in params else None
+    )
 
     ready = threading.Event()
     now = time.time()
@@ -5423,6 +5518,7 @@ def _(rid, params: dict) -> dict:
             "message_count": len(history),
             "messages": _history_to_messages(history),
             "info": {
+                **_session_model_controls(record),
                 # Reflect the per-session model override (desktop composer pick)
                 # in the immediate response so the client doesn't briefly clobber
                 # its sticky pick with the global default before the deferred
@@ -6362,11 +6458,11 @@ def _(rid, params: dict) -> dict:
                 "resumed": target,
                 "message_count": len(messages),
                 "messages": messages,
-                "info": _lazy_resume_info(
-                    cwd,
-                    model=model_override.get("model") or "",
-                    provider=overrides.get("provider_override") or "",
-                ),
+                "info": {
+                    **_lazy_resume_info(cwd, model=model_override.get("model") or "",
+                                        provider=overrides.get("provider_override") or ""),
+                    **_session_model_controls(record),
+                },
                 "inflight": None,
                 "running": False,
                 "session_key": target,
@@ -8416,6 +8512,7 @@ def _(rid, params: dict) -> dict:
             # has a live compressor reading) plus tokens totals. Additive; v1
             # consumers reading the text output are unaffected.
             "usage": usage,
+            **_session_model_controls(session),
         },
     )
 
@@ -8653,6 +8750,11 @@ def _(rid, params: dict) -> dict:
     if limit_message is not None:
         return _err(rid, 4090, limit_message)
     branch_name = params.get("name", "")
+    branch_config = _runtime_model_config(session.get("agent"), {"_branched_from": old_key})
+    branch_model = branch_config.get("model") or _resolve_model()
+    # Only actual parent runtime values become overrides; a legacy record
+    # without runtime metadata still resolves its defaults at construction.
+    branch_overrides = _stored_session_runtime_overrides({"model_config": branch_config})
     try:
         if branch_name:
             title = branch_name
@@ -8666,13 +8768,13 @@ def _(rid, params: dict) -> dict:
         db.create_session(
             new_key,
             source=_session_source(session),
-            model=_resolve_model(),
+            model=branch_model,
             # Stable _branched_from marker so list_sessions_rich() keeps the
             # branch visible in /resume and /sessions. The TUI branch leaves
             # the parent live (no end_reason='branched'), so the legacy
             # end_reason heuristic never matches it — the marker is the only
             # thing that surfaces TUI branches. See issue #20856.
-            model_config={"_branched_from": old_key},
+            model_config=branch_config,
             parent_session_id=old_key,
             cwd=_session_cwd(session),
         )
@@ -8690,7 +8792,7 @@ def _(rid, params: dict) -> dict:
     try:
         tokens = _set_session_context(new_key)
         try:
-            agent = _make_agent(new_sid, new_key, session_id=new_key)
+            agent = _make_agent(new_sid, new_key, session_id=new_key, **branch_overrides)
         finally:
             _clear_session_context(tokens)
         _init_session(
@@ -8698,6 +8800,7 @@ def _(rid, params: dict) -> dict:
         )
         if new_sid in _sessions:
             _sessions[new_sid]["active_session_lease"] = lease
+            _sessions[new_sid]["model_override"] = branch_overrides.get("model_override")
     except Exception as e:
         if lease is not None:
             lease.release()
@@ -10773,6 +10876,16 @@ def _(rid, params: dict) -> dict:
     key, value = params.get("key", ""), params.get("value", "")
     session = _sessions.get(params.get("session_id", ""))
 
+    if key in {"reasoning", "fast"}:
+        # Explicit session controls fail closed after expiry, rather than
+        # quietly falling through to a profile-wide config write.
+        if (params.get("session_id") or params.get("scope") == "session") and session is None:
+            return _err(rid, 4007, "session not found")
+        if session is not None and session.get("running"):
+            return _err(rid, 4009, "session busy")
+        if session is not None and session.get("agent") is None and session.get("agent_build_started"):
+            return _err(rid, 4009, "session initializing")
+
     if key == "model":
         try:
             if not value:
@@ -10838,10 +10951,10 @@ def _(rid, params: dict) -> dict:
     if key == "fast":
         raw = str(value or "").strip().lower()
         agent = session.get("agent") if session else None
-        if agent is not None:
-            current_fast = getattr(agent, "service_tier", None) == "priority"
-        else:
-            current_fast = _load_service_tier() == "priority"
+        current_fast = (
+            _session_model_controls(session)["fast"]
+            if session is not None else _load_service_tier() == "priority"
+        )
 
         if raw in {"status"}:
             return _ok(
@@ -10863,7 +10976,8 @@ def _(rid, params: dict) -> dict:
             from hermes_cli.models import resolve_fast_mode_overrides
 
             target_model = (
-                getattr(agent, "model", None) if agent is not None else _resolve_model()
+                getattr(agent, "model", None) if agent is not None
+                else (((session or {}).get("model_override") or {}).get("model") or _resolve_model())
             )
             if not target_model:
                 return _err(
@@ -10879,7 +10993,10 @@ def _(rid, params: dict) -> dict:
                     "fast mode is not available for this model",
                 )
 
-        _write_config_key("agent.service_tier", nv)
+        if session is not None:
+            session["create_service_tier_override"] = "priority" if nv == "fast" else "normal"
+        else:
+            _write_config_key("agent.service_tier", nv)
         if agent is not None:
             agent.service_tier = "priority" if nv == "fast" else None
             current_overrides = dict(getattr(agent, "request_overrides", {}) or {})
@@ -10888,11 +11005,12 @@ def _(rid, params: dict) -> dict:
             if nv == "fast":
                 current_overrides.update(overrides)
             agent.request_overrides = current_overrides
+        if session is not None:
             _persist_live_session_runtime(session)
             _emit(
                 "session.info",
                 params.get("session_id", ""),
-                _session_info(agent, session),
+                _session_info(agent, session) if agent is not None else _session_model_controls(session),
             )
         return _ok(rid, {"key": key, "value": nv})
 
@@ -11012,6 +11130,15 @@ def _(rid, params: dict) -> dict:
             from hermes_constants import parse_reasoning_effort
 
             arg = str(value or "").strip().lower()
+            if session is not None:
+                # Display aliases are session controls too; legacy calls without
+                # a session retain their profile-wide display preferences below.
+                if arg in {"show", "on", "hide", "off"}:
+                    session["show_reasoning"] = arg in {"show", "on"}
+                    return _ok(rid, {"key": key, "value": "show" if session["show_reasoning"] else "hide"})
+                if arg in {"full", "all", "clamp", "collapse", "short"}:
+                    session["reasoning_full"] = arg in {"full", "all"}
+                    return _ok(rid, {"key": key, "value": "full" if session["reasoning_full"] else "clamp"})
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
                 display = (
@@ -11100,12 +11227,12 @@ def _(rid, params: dict) -> dict:
                 session["create_reasoning_override"] = parsed
                 if session.get("agent") is not None:
                     session["agent"].reasoning_config = parsed
-                    _persist_live_session_runtime(session)
-                    _emit(
-                        "session.info",
-                        params.get("session_id", ""),
-                        _session_info(session["agent"], session),
-                    )
+                _persist_live_session_runtime(session)
+                _emit(
+                    "session.info",
+                    params.get("session_id", ""),
+                    _session_info(session["agent"], session) if session.get("agent") is not None else _session_model_controls(session),
+                )
             else:
                 _write_config_key("agent.reasoning_effort", arg)
             return _ok(rid, {"key": key, "value": arg})
@@ -11728,6 +11855,8 @@ def _(rid, params: dict) -> dict:
 @method("config.get")
 def _(rid, params: dict) -> dict:
     key = params.get("key", "")
+    if key in {"reasoning", "fast"} and (params.get("session_id") or params.get("scope") == "session") and params.get("session_id") not in _sessions:
+        return _err(rid, 4007, "session not found")
     if key == "provider":
         try:
             from hermes_cli.models import list_available_providers, normalize_provider
@@ -11786,6 +11915,14 @@ def _(rid, params: dict) -> dict:
         # Prefer the session's live value — `config.set reasoning` is
         # session-scoped, so the global key may not reflect this chat.
         session = _sessions.get(params.get("session_id", ""))
+        if session is not None:
+            controls = _session_model_controls(session)
+            show = session.get("show_reasoning", (cfg.get("display") or {}).get("show_reasoning", True))
+            return _ok(rid, {
+                "value": controls["reasoning_effort"],
+                "display": "show" if show else "hide",
+                "model_controls": controls["model_controls"],
+            })
         live = getattr((session or {}).get("agent"), "reasoning_config", None)
         if live is None and session is not None:
             live = session.get("create_reasoning_override")
@@ -11809,15 +11946,13 @@ def _(rid, params: dict) -> dict:
         )
         return _ok(rid, {"value": effort, "display": display})
     if key == "fast":
+        session = _sessions.get(params.get("session_id", ""))
         return _ok(
             rid,
             {
                 "value": (
-                    "fast"
-                    if (session := _sessions.get(params.get("session_id", "")))
-                    and getattr(session.get("agent"), "service_tier", None)
-                    == "priority"
-                    else ("fast" if _load_service_tier() == "priority" else "normal")
+                    ("fast" if _session_model_controls(session)["fast"] else "normal")
+                    if session is not None else ("fast" if _load_service_tier() == "priority" else "normal")
                 ),
             },
         )

@@ -19,6 +19,8 @@ SESSION_RUNTIME_CAPABILITIES = {
     # durable conversation). Advertised only because the pool is live and
     # limits runtime materialization regardless of client opt-in.
     "runtime_pool": True,
+    # config.set reasoning/fast with a session never writes profile defaults.
+    "session_model_controls": True,
 }
 
 

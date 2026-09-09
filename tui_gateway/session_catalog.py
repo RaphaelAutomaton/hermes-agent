@@ -143,6 +143,18 @@ class SessionCatalog:
             lineage = cursor_lineage
             tip_session_id = cursor_tip
 
+        # Read routing identity only, never expose the persisted model_config.
+        tip = self._db.get_session(tip_session_id) or {}
+        try:
+            model_config = json.loads(tip.get("model_config") or "{}")
+        except (TypeError, ValueError):
+            model_config = {}
+        metadata = {"model": tip.get("model")}
+        if isinstance(model_config, dict):
+            metadata["provider"] = model_config.get("provider")
+        metadata = {key: value for key, value in metadata.items()
+                    if isinstance(value, str) and value and len(value) <= 256}
+
         roles = ["user", "assistant"] if view == "dialog" else None
         rows, snapshot_max_id = self._db.read_message_rows_page(
             lineage,
@@ -182,6 +194,7 @@ class SessionCatalog:
                 "page_bytes": 0,
                 "has_more": has_more,
                 "next_cursor": next_cursor,
+                **metadata,
             }
             # page_bytes describes the complete compact JSON result. Iterate to
             # a fixed point because writing the decimal size can change its own

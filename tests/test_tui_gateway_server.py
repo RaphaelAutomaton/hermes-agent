@@ -2730,7 +2730,7 @@ def test_config_set_yolo_global_scope_honors_explicit_value(tmp_path, monkeypatc
     assert yaml.safe_load(cfg_path.read_text())["approvals"]["mode"] == "off"
 
 
-def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
+def test_config_set_fast_updates_live_agent_not_global_config(monkeypatch):
     writes = []
     emits = []
     agent = types.SimpleNamespace(
@@ -2764,7 +2764,7 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
             "foo": "bar",
             "service_tier": "priority",
         }
-        assert ("agent.service_tier", "fast") in writes
+        assert writes == []
         assert ("session.info", "sid", {"model": "x"}) in emits
 
         resp_normal = server.handle_request(
@@ -2777,9 +2777,37 @@ def test_config_set_fast_updates_live_agent_and_config(monkeypatch):
         assert resp_normal["result"]["value"] == "normal"
         assert agent.service_tier is None
         assert agent.request_overrides == {"foo": "bar"}
-        assert ("agent.service_tier", "normal") in writes
+        assert writes == []
     finally:
         server._sessions.pop("sid", None)
+
+
+@pytest.mark.parametrize('key,value', [('fast', 'fast'), ('fast', 'normal'), ('reasoning', 'low')])
+def test_config_set_without_session_retains_global_persistence(tmp_path, monkeypatch, key, value):
+    monkeypatch.setattr(server, '_hermes_home', tmp_path)
+    monkeypatch.setattr(server, '_resolve_model', lambda: 'gpt-6-astra')
+    response = server.handle_request({
+        'id': 'global', 'method': 'config.set', 'params': {'key': key, 'value': value},
+    })
+    assert response['result']['value'] == value
+    config_key = 'service_tier' if key == 'fast' else 'reasoning_effort'
+    assert server._load_cfg()['agent'][config_key] == value
+
+
+@pytest.mark.parametrize('value,section', [('show', 'expanded'), ('hide', 'hidden'),
+                                           ('full', 'expanded'), ('clamp', 'collapsed')])
+def test_reasoning_display_without_session_retains_global_persistence(tmp_path, monkeypatch, value, section):
+    monkeypatch.setattr(server, '_hermes_home', tmp_path)
+    response = server.handle_request({
+        'id': 'global', 'method': 'config.set', 'params': {'key': 'reasoning', 'value': value},
+    })
+    assert response['result']['value'] == value
+    display = server._load_cfg()['display']
+    assert display['sections']['thinking'] == section
+    if value in {'full', 'clamp'}:
+        assert display['reasoning_full'] is (value == 'full')
+    else:
+        assert display['show_reasoning'] is (value == 'show')
 
 
 def test_config_set_fast_status_is_non_mutating(monkeypatch):
@@ -3309,6 +3337,7 @@ def test_complete_slash_details_args():
 
 def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "_hermes_home", tmp_path)
+    original_cfg = server._load_cfg()
     agent = types.SimpleNamespace(reasoning_config=None)
     server._sessions["sid"] = _session(agent=agent)
 
@@ -3331,7 +3360,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_show["result"]["value"] == "show"
     assert server._sessions["sid"]["show_reasoning"] is True
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "expanded"
+    assert server._load_cfg() == original_cfg
 
     resp_hide = server.handle_request(
         {
@@ -3342,7 +3371,7 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     )
     assert resp_hide["result"]["value"] == "hide"
     assert server._sessions["sid"]["show_reasoning"] is False
-    assert server._load_cfg()["display"]["sections"]["thinking"] == "hidden"
+    assert server._load_cfg() == original_cfg
 
     # /reasoning full | clamp — parity with the classic CLI reasoning_full
     # toggle. In the TUI these map to the thinking section's expand/collapse
@@ -3355,9 +3384,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_full["result"]["value"] == "full"
-    cfg_full = server._load_cfg()
-    assert cfg_full["display"]["reasoning_full"] is True
-    assert cfg_full["display"]["sections"]["thinking"] == "expanded"
+    assert server._sessions["sid"]["reasoning_full"] is True
+    assert server._load_cfg() == original_cfg
 
     resp_clamp = server.handle_request(
         {
@@ -3367,9 +3395,8 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
         }
     )
     assert resp_clamp["result"]["value"] == "clamp"
-    cfg_clamp = server._load_cfg()
-    assert cfg_clamp["display"]["reasoning_full"] is False
-    assert cfg_clamp["display"]["sections"]["thinking"] == "collapsed"
+    assert server._sessions["sid"]["reasoning_full"] is False
+    assert server._load_cfg() == original_cfg
 
 
 def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch):
@@ -7461,6 +7488,15 @@ def test_make_agent_defaults_to_90(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 90
 
 
+@pytest.mark.parametrize('override,expected', [('normal', None), ('priority', 'priority'), (None, 'priority')])
+def test_make_agent_normal_tier_does_not_inherit_global(monkeypatch, override, expected):
+    _setup_make_agent_mocks(monkeypatch, {})
+    monkeypatch.setattr(server, '_load_service_tier', lambda: 'priority')
+    with patch('run_agent.AIAgent') as make:
+        server._make_agent('sid', 'key', service_tier_override=override)
+    assert make.call_args.kwargs['service_tier'] == expected
+
+
 def test_make_agent_uses_session_runtime_overrides(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
     resolved = {}
@@ -8427,14 +8463,14 @@ def test_session_create_records_ui_model_as_session_override(monkeypatch):
                 "model": "claude-sonnet-4.6",
                 "provider": "anthropic",
                 "reasoning_effort": "high",
-                "fast": True,
+                "fast": False,  # Sonnet does not support native fast mode.
             },
         )
         sid = resp["result"]["session_id"]
         sess = server._sessions[sid]
         assert sess["model_override"] == {"model": "claude-sonnet-4.6", "provider": "anthropic"}
         assert sess["create_reasoning_override"] is not None
-        assert sess["create_service_tier_override"] == "priority"
+        assert sess["create_service_tier_override"] == "normal"
         # The immediate response reflects the override (not the global default) so
         # the client never clobbers its sticky pick before the build lands.
         assert resp["result"]["info"]["model"] == "claude-sonnet-4.6"

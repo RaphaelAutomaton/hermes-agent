@@ -38,6 +38,25 @@ def _compression_chain(db):
     db.append_message("tip", "assistant", "four", timestamp=4)
 
 
+def test_cold_metadata_uses_tip_model_and_only_explicit_provider(catalog):
+    db, cold = catalog
+    db.create_session('meta-root', 'cli', model='old-model')
+    db.end_session('meta-root', end_reason='compression')
+    db.create_session('meta-tip', 'cli', parent_session_id='meta-root',
+                      model='vendor/model:preview', model_config={
+                          'provider': 'custom:lab', 'api_key': 'fixture-not-a-secret',
+                          'base_url': 'https://private.invalid',
+                      })
+    page = cold.read('meta-root')
+    assert page['model'] == 'vendor/model:preview'
+    assert page['provider'] == 'custom:lab'
+    assert 'api_key' not in page and 'base_url' not in page and 'model_config' not in page
+    assert page['page_bytes'] == len(json.dumps(page, ensure_ascii=False, separators=(',', ':')).encode())
+    db.create_session('meta-unknown', 'cli')
+    unknown = cold.read('meta-unknown')
+    assert 'model' not in unknown and 'provider' not in unknown
+
+
 def test_cold_tail_read_pages_across_compression_without_runtime(catalog):
     db, cold = catalog
     _compression_chain(db)
