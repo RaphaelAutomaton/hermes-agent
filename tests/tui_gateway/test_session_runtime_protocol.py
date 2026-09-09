@@ -53,6 +53,8 @@ def test_ready_payload_negotiates_only_implemented_v2_capabilities():
         "subscriptions": True,
         "runtime_pool": True,
         "session_model_controls": True,
+        "skill_invocation": True,
+        "explicit_queue": True,
     }
 
 

@@ -21,6 +21,8 @@ SESSION_RUNTIME_CAPABILITIES = {
     "runtime_pool": True,
     # config.set reasoning/fast with a session never writes profile defaults.
     "session_model_controls": True,
+    "skill_invocation": True,
+    "explicit_queue": True,
 }
 
 

@@ -9077,6 +9077,30 @@ def _(rid, params: dict) -> dict:
     return _ok(rid, payload)
 
 
+@method("session.queue")
+def _(rid, params: dict) -> dict:
+    """Queue explicitly without inheriting the global busy-input interrupt mode.
+
+    Idle callers use prompt.submit. A finish race is an explicit rejection,
+    never an implicit new turn or a retry that might duplicate a user request.
+    """
+    text = params.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > 200_000:
+        return _err(rid, 4002, "non-empty bounded text is required")
+    session_id = params.get("session_id")
+    if not isinstance(session_id, str) or not session_id.strip():
+        return _err(rid, 4003, "session_id must be a non-empty string")
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    with session["history_lock"]:
+        if not session.get("running"):
+            return _err(rid, 4009, "no active turn to queue behind; use prompt.submit")
+        _enqueue_prompt(session, text, current_transport() or session.get("transport"))
+        session["last_active"] = time.time()
+    return _ok(rid, {"status": "queued"})
+
+
 @method("session.steer")
 def _(rid, params: dict) -> dict:
     """Inject a user message into the next tool result without interrupting.
@@ -12382,12 +12406,15 @@ def _(rid, params: dict) -> dict:
                 warning = f"quick_commands discovery unavailable: {e}"
 
         skill_count = 0
+        skill_entries: list[dict[str, str]] = []
         try:
             from agent.skill_commands import scan_skill_commands
 
             for k, info in sorted(scan_skill_commands().items()):
                 d = str(info.get("description", "Skill"))
-                all_pairs.append([k, d[:120] + ("…" if len(d) > 120 else "")])
+                description = d[:120] + ("…" if len(d) > 120 else "")
+                all_pairs.append([k, description])
+                skill_entries.append({"name": k, "description": description})
                 skill_count += 1
         except Exception as e:
             warning = f"skill discovery unavailable: {e}"
@@ -12404,6 +12431,7 @@ def _(rid, params: dict) -> dict:
                 "canon": canon,
                 "categories": categories,
                 "skill_count": skill_count,
+                "skill_entries": skill_entries,
                 "warning": warning,
             },
         )
@@ -12487,6 +12515,51 @@ def _resolve_name(name: str) -> str:
         return r.name if r else name
     except Exception:
         return name
+
+
+@method("skill.invoke")
+def _(rid, params: dict) -> dict:
+    """Expand an explicitly selected skill, never a quick/plugin/builtin command."""
+    import re
+
+    name, arg = params.get("name"), params.get("arg", "")
+    if (
+        not isinstance(name, str)
+        or len(name) > 256
+        or not re.fullmatch(r"/?[a-z0-9][a-z0-9_-]*", name)
+    ):
+        return _err(rid, 4003, "name must be a native skill command (1-256 characters)")
+    if not isinstance(arg, str) or len(arg) > 100_000:
+        return _err(rid, 4003, "arg must be a string of at most 100000 characters")
+    if params.get("session_id") is not None and not isinstance(params["session_id"], str):
+        return _err(rid, 4003, "session_id must be a string")
+
+    session, err = _sess(params, rid)
+    if err:
+        return err
+    if session.get("running"):
+        return _err(rid, 4002, "session busy")
+
+    try:
+        from agent.skill_commands import (
+            scan_skill_commands,
+            resolve_skill_command_key,
+            build_skill_invocation_message,
+        )
+
+        commands = scan_skill_commands()
+        key = resolve_skill_command_key(name.removeprefix("/"))
+        if key not in commands:
+            return _err(rid, 4011, "skill_unavailable")
+        message = build_skill_invocation_message(
+            key, arg, task_id=session.get("session_key", "")
+        )
+        if not isinstance(message, str) or not message:
+            return _err(rid, 5021, "skill_load_failed")
+        return _ok(rid, {"type": "skill", "name": commands[key]["name"], "message": message})
+    except Exception:
+        # Skill loaders/preprocessors may expose paths or secret values in errors.
+        return _err(rid, 5021, "skill_load_failed")
 
 
 @method("command.dispatch")
