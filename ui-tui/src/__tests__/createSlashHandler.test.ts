@@ -4,7 +4,9 @@ import { createSlashHandler } from '../app/createSlashHandler.js'
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
 import { DASHBOARD_EXIT_DISABLED_MESSAGE, DASHBOARD_UPDATE_DISABLED_MESSAGE } from '../app/slash/commands/core.js'
 import { getUiState, patchUiState, resetUiState } from '../app/uiStore.js'
+import { hydrateFullConfig } from '../app/useConfigSync.js'
 import type * as EnvModule from '../config/env.js'
+import { sectionMode } from '../domain/details.js'
 import { TUI_SESSION_MODEL_FLAG } from '../domain/slash.js'
 
 // DASHBOARD_TUI_MODE resolves once at module load from HERMES_TUI_DASHBOARD,
@@ -23,6 +25,23 @@ vi.mock('../config/env.js', async importActual => {
 })
 
 describe('createSlashHandler', () => {
+  it.each(['full', 'clamp', 'show', 'hide'])('fences pending same-session hydration after /reasoning %s', async value => {
+    let finish!: (value: unknown) => void
+    const gw = { request: vi.fn(() => new Promise(resolve => { finish = resolve })) } as any
+    const ctx = buildCtx({ gateway: { ...buildCtx().gateway, rpc: vi.fn(async () => ({ value })) } })
+    patchUiState({ sid: 'sid-abc', showReasoning: false, sections: { thinking: 'hidden' } })
+    const bell = vi.fn()
+    const pending = hydrateFullConfig(gw, bell)
+    expect(createSlashHandler(ctx)(`/reasoning ${value}`)).toBe(true)
+    await vi.waitFor(() => expect(ctx.transcript.sys).toHaveBeenCalledWith(`reasoning: ${value}`))
+    const confirmed = getUiState()
+    finish({ config: { display: { show_reasoning: true, sections: { thinking: 'expanded' } } } })
+    expect(await pending).toBeNull()
+    expect(getUiState().sections).toEqual(confirmed.sections)
+    expect(getUiState().showReasoning).toBe(confirmed.showReasoning)
+    expect(bell).not.toHaveBeenCalled()
+  })
+
   beforeEach(() => {
     resetOverlayState()
     resetUiState()
@@ -265,6 +284,18 @@ describe('createSlashHandler', () => {
       expect(getUiState().showReasoning).toBe(true)
       expect(getUiState().sections.thinking).toBe('expanded')
     })
+  })
+
+  it.each(['full', 'clamp'])('applies /reasoning %s to the effective thinking mode', async value => {
+    patchUiState({ sections: { thinking: 'hidden', tools: 'collapsed' }, showReasoning: false, sid: 'sid-abc' })
+    const ctx = buildCtx({ gateway: { ...buildGateway(), rpc: vi.fn(() => Promise.resolve({ value })) } })
+    expect(createSlashHandler(ctx)(`/reasoning ${value}`)).toBe(true)
+    await vi.waitFor(() => expect(ctx.transcript.sys).toHaveBeenCalledWith(`reasoning: ${value}`))
+    const state = getUiState()
+    expect(state.showReasoning).toBe(false)
+    expect(sectionMode('thinking', state.detailsMode, state.sections, state.detailsModeCommandOverride))
+      .toBe(value === 'full' ? 'expanded' : 'collapsed')
+    expect(state.sections.tools).toBe('collapsed')
   })
 
   it('opens the skills hub locally for bare /skills', () => {

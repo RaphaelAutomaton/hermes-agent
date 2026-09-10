@@ -204,6 +204,112 @@ def test_skill_load_failures_are_explicit_without_exception_details(skills, monk
     assert "result" not in response
 
 
+@pytest.mark.parametrize("lazy", [False, True])
+@pytest.mark.parametrize("control", ["approval.respond", "session.interrupt"])
+def test_slow_skill_dispatch_keeps_interrupt_and_approval_responsive(skills, monkeypatch, lazy, control):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    from tui_gateway.transport import current_transport
+
+    skills("handoff")
+    entered, release, returned, replied = (threading.Event() for _ in range(4))
+    frames, seen = [], []
+
+    class Sink:
+        def write(self, frame):
+            frames.append(frame)
+            replied.set()
+            return True
+
+    owner = Sink()
+    session = server._sessions["sid"]
+    session["transport"] = owner
+    if lazy:
+        session.update(agent=None, agent_ready=threading.Event(), agent_build_started=False)
+    build = Mock()
+    wait = Mock(return_value=server._err("control", 5032, "must not wait"))
+    monkeypatch.setattr(server, "_start_agent_build", build)
+    monkeypatch.setattr(server, "_wait_agent", wait)
+    original = skill_commands.build_skill_invocation_message
+
+    def slow(*args, **kwargs):
+        seen.append(current_transport())
+        entered.set()
+        assert release.wait(5), "test failed to release preprocessing"
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(skill_commands, "build_skill_invocation_message", slow)
+    # Use the real approval resolver, but an isolated pending entry.
+    from tools import approval as approval_module
+    request_id = "a" * 32
+    approval = approval_module._ApprovalEntry({"request_id": request_id})
+    monkeypatch.setattr(approval_module, "_gateway_queues", {"durable-key": [approval]})
+    session["history_lock"] = threading.RLock()
+    monkeypatch.setattr(server, "_pending", {})
+    monkeypatch.setattr(server, "_answers", {})
+
+    def read_loop():
+        server.dispatch({"id": "slow", "method": "skill.invoke", "params": {
+            "session_id": "sid", "name": "/handoff",
+        }}, transport=owner)
+        returned.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        monkeypatch.setattr(server, "_pool", pool)
+        reader = threading.Thread(target=read_loop)
+        reader.start()
+        try:
+            assert entered.wait(3)
+            assert returned.wait(0.5), "skill.invoke blocked the dispatcher during preprocessing"
+            answer = server.dispatch({"id": "control", "method": control, "params": {
+                "session_id": "sid", "request_id": request_id, "choice": "once",
+            }}, transport=owner)
+            build.assert_not_called()
+            wait.assert_not_called()
+            if control == "approval.respond":
+                assert answer["result"]["resolved"] == 1
+                assert approval.result == "once"
+            else:
+                assert answer["result"]["status"] == "interrupted"
+                assert approval.result == "deny"
+                assert session["_turn_cancel_requested"] is True
+            assert approval.event.is_set()
+            assert not replied.is_set(), "skill should still be blocked in test loader"
+        finally:
+            release.set()
+            reader.join(5)
+    assert replied.wait(1)
+    assert frames[0]["id"] == "slow"
+    assert "PRIVATE_SKILL_BODY" in frames[0]["result"]["message"]
+    assert seen == [owner]
+    assert session["transport"] is owner
+    assert session["running"] is False
+
+
+@pytest.mark.parametrize("running", [False, True])
+def test_lazy_skill_never_builds_or_waits_for_an_agent(skills, monkeypatch, running):
+    import threading
+
+    skills("handoff")
+    session = server._sessions["sid"]
+    session.update(agent=None, running=running, agent_ready=threading.Event(), agent_build_started=False)
+    build = Mock()
+    wait = Mock(return_value=server._err("lazy", 5032, "must not wait"))
+    monkeypatch.setattr(server, "_start_agent_build", build)
+    monkeypatch.setattr(server, "_wait_agent", wait)
+    before = dict(session)
+    result = server.handle_request({"id": "lazy", "method": "skill.invoke", "params": {
+        "session_id": "sid", "name": "/handoff",
+    }})
+    build.assert_not_called()
+    wait.assert_not_called()
+    assert session == before
+    if running:
+        assert result["error"]["code"] == 4002
+    else:
+        assert "PRIVATE_SKILL_BODY" in result["result"]["message"]
+
+
 def test_ready_advertises_native_skill_invocation():
     from tui_gateway.protocol import gateway_ready_payload
 

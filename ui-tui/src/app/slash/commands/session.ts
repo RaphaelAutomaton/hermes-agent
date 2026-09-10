@@ -465,11 +465,11 @@ export const sessionCommands: SlashCommand[] = [
               sections: { ...state.sections, thinking: 'hidden' },
               showReasoning: false
             }))
-          } else if (r.value === 'show') {
+          } else if (r.value === 'show' || r.value === 'full' || r.value === 'clamp') {
             patchUiState(state => ({
               ...state,
-              sections: { ...state.sections, thinking: 'expanded' },
-              showReasoning: true
+              sections: { ...state.sections, thinking: r.value === 'clamp' ? 'collapsed' : 'expanded' },
+              showReasoning: r.value === 'show' ? true : state.showReasoning
             }))
           }
 

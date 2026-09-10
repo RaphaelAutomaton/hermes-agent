@@ -277,6 +277,9 @@ _LONG_HANDLERS = frozenset(
         "session.read",
         "session.resume",
         "shell.exec",
+        # Skill discovery/preprocessing can execute opt-in inline shell. Keep
+        # approval/interrupt RPCs readable while expansion is in progress.
+        "skill.invoke",
         "skills.manage",
         "slash.exec",
     }
@@ -1965,6 +1968,11 @@ def _ensure_session_db_row(session: dict) -> None:
         model_config["reasoning_config"] = reasoning
     if tier := session.get("create_service_tier_override"):
         model_config["service_tier"] = tier
+    if mode := session.get("reasoning_display"):
+        model_config["_tui_thinking"] = mode
+    for field in ("show_reasoning", "reasoning_full"):
+        if field in session:
+            model_config["_tui_" + field] = session[field]
     # Branch lineage: stamp the same ``_branched_from`` marker the TUI /branch
     # uses so list_sessions_rich keeps the branch listed and the desktop sidebar
     # can nest it under its parent.
@@ -2045,6 +2053,59 @@ def _session_db(session: dict):
         if close_db and db is not None:
             with contextlib.suppress(Exception):
                 db.close()
+
+
+def _session_reasoning_display(session: dict | None, field: str = "reasoning_display") -> str | bool | None:
+    """Read only the session's explicit display override; defaults stay global.
+
+    Keep this outside agent construction: a cold/lazy resume can hydrate its UI
+    from its own DB without constructing an LLM client or changing model kwargs.
+    """
+    if not session:
+        return None
+    # Cold resume seeds show_reasoning from the global config. Until an
+    # explicit in-memory display change exists, the durable override wins.
+    mode = session.get(field) if session.get("reasoning_display") else None
+    if mode is None and session.get("session_key"):
+        with _session_db(session) as db:
+            row = db.get_session(session["session_key"]) if db is not None else None
+        raw = (row or {}).get("model_config") or {}
+        try:
+            config = json.loads(raw) if isinstance(raw, str) else raw
+            key = "_tui_thinking" if field == "reasoning_display" else "_tui_" + field
+            mode = config.get(key, session.get(field)) if isinstance(config, dict) else session.get(field)
+        except (ValueError, TypeError):
+            mode = None
+    if field != "reasoning_display":
+        return mode if isinstance(mode, bool) else None
+    return mode if mode in ("expanded", "collapsed", "hidden") else None
+
+
+def _set_session_reasoning_display(session: dict, mode: str, *, show: bool | None = None) -> None:
+    """Persist a display-only override in the owning row, never config.yaml.
+
+    Drafts remain in memory until their first activity creates the row.
+    """
+    # Expansion and visibility are independent, as in ec5cb333. Preserve
+    # cold-resumed flags when updating either control.
+    flags = {field: _session_reasoning_display(session, field)
+             for field in ("show_reasoning", "reasoning_full")}
+    if show is not None:
+        flags["show_reasoning"] = show
+    else:
+        flags["reasoning_full"] = mode == "expanded"
+    flags = {key: value for key, value in flags.items() if value is not None}
+    if session.get("session_key"):
+        with _session_db(session) as db:
+            row = db.get_session(session["session_key"]) if db is not None else None
+            if row:
+                raw = row.get("model_config") or {}
+                config = json.loads(raw) if isinstance(raw, str) else dict(raw)
+                config["_tui_thinking"] = mode
+                config.update({"_tui_" + key: value for key, value in flags.items()})
+                db.update_session_meta(session["session_key"], json.dumps(config))
+    session["reasoning_display"] = mode
+    session.update(flags)
 
 
 def _persist_session_git_meta(session: dict, cwd: str) -> None:
@@ -8810,7 +8871,8 @@ def _(rid, params: dict) -> dict:
 
 @method("session.interrupt")
 def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
+    # Control paths must remain available during lazy skill preprocessing.
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     # Safety net: if the turn's run thread is already gone but `running` stayed
@@ -10871,7 +10933,8 @@ def _(rid, params: dict) -> dict:
     choice = params.get("choice")
     if choice not in {"once", "session", "always", "deny"}:
         return _err(rid, 4002, "invalid approval choice")
-    session, err = _sess(params, rid)
+    # Resolving the owning approval queue does not require an agent.
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     try:
@@ -11158,10 +11221,10 @@ def _(rid, params: dict) -> dict:
                 # Display aliases are session controls too; legacy calls without
                 # a session retain their profile-wide display preferences below.
                 if arg in {"show", "on", "hide", "off"}:
-                    session["show_reasoning"] = arg in {"show", "on"}
+                    _set_session_reasoning_display(session, "expanded" if arg in {"show", "on"} else "hidden", show=arg in {"show", "on"})
                     return _ok(rid, {"key": key, "value": "show" if session["show_reasoning"] else "hide"})
                 if arg in {"full", "all", "clamp", "collapse", "short"}:
-                    session["reasoning_full"] = arg in {"full", "all"}
+                    _set_session_reasoning_display(session, "expanded" if arg in {"full", "all"} else "collapsed")
                     return _ok(rid, {"key": key, "value": "full" if session["reasoning_full"] else "clamp"})
             if arg in {"show", "on"}:
                 cfg = _load_cfg()
@@ -11909,7 +11972,19 @@ def _(rid, params: dict) -> dict:
         cwd = _completion_cwd({"cwd": raw} if raw else {})
         return _ok(rid, {"cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
     if key == "full":
-        return _ok(rid, {"config": _load_cfg()})
+        cfg = _load_cfg()
+        session = _sessions.get(params.get("session_id", ""))
+        mode = _session_reasoning_display(session)
+        if mode is not None:
+            # Overlay copies, never mutate the cached profile config.
+            display = dict(cfg.get("display") or {})
+            display["sections"] = {**(display.get("sections") or {}), "thinking": mode}
+            for field in ("show_reasoning", "reasoning_full"):
+                flag = _session_reasoning_display(session, field)
+                if flag is not None:
+                    display[field] = flag
+            cfg = {**cfg, "display": display}
+        return _ok(rid, {"config": cfg})
     if key == "prompt":
         return _ok(rid, {"prompt": _load_cfg().get("custom_prompt", "")})
     if key == "skin":
@@ -11942,6 +12017,9 @@ def _(rid, params: dict) -> dict:
         if session is not None:
             controls = _session_model_controls(session)
             show = session.get("show_reasoning", (cfg.get("display") or {}).get("show_reasoning", True))
+            visible = _session_reasoning_display(session, "show_reasoning")
+            if visible is not None:
+                show = visible
             return _ok(rid, {
                 "value": controls["reasoning_effort"],
                 "display": "show" if show else "hide",
@@ -12534,7 +12612,9 @@ def _(rid, params: dict) -> dict:
     if params.get("session_id") is not None and not isinstance(params["session_id"], str):
         return _err(rid, 4003, "session_id must be a string")
 
-    session, err = _sess(params, rid)
+    # Expansion needs only the durable task key, not an AIAgent or a runtime
+    # lease. In particular, don't hydrate lazy sessions (or wait on a build).
+    session, err = _sess_nowait(params, rid)
     if err:
         return err
     if session.get("running"):

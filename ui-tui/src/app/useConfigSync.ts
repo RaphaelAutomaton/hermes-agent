@@ -15,7 +15,7 @@ import {
   type StatusBarMode
 } from './interfaces.js'
 import { turnController } from './turnController.js'
-import { patchUiState } from './uiStore.js'
+import { $uiState, getUiState, patchUiState } from './uiStore.js'
 
 const STATUSBAR_ALIAS: Record<string, StatusBarMode> = {
   bottom: 'bottom',
@@ -185,12 +185,31 @@ const _pasteCollapseCharsFromConfig = (cfg: ConfigFullResponse | null): number =
  * Both the initial hydration and the mtime poller use this shared
  * helper, so a regression in the fetch/apply plumbing now fails the
  * useConfigSync tests instead of only being visible at runtime. */
+let fullConfigRequest = 0
+
 export async function hydrateFullConfig(
   gw: GatewayClient,
   setBell: (v: boolean) => void,
   setVoiceRecordKey?: (v: ParsedVoiceRecordKey) => void
 ): Promise<ConfigFullResponse | null> {
-  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', { key: 'full' })
+  const { sid, sections, showReasoning } = getUiState()
+  const request = ++fullConfigRequest
+  let superseded = false
+  const unlisten = $uiState.listen(state => {
+    // A confirmed display command in the same session wins over a config
+    // snapshot requested before it. Also fence changes that are later undone.
+    if (state.sid !== sid || state.sections !== sections || state.showReasoning !== showReasoning) {
+      superseded = true
+    }
+  })
+  const cfg = await quietRpc<ConfigFullResponse>(gw, 'config.get', {
+    key: 'full',
+    ...(sid ? { session_id: sid } : {})
+  })
+  unlisten()
+  if (superseded || getUiState().sid !== sid || request !== fullConfigRequest) {
+    return null
+  }
   applyDisplay(cfg, setBell, setVoiceRecordKey)
 
   return cfg
@@ -252,10 +271,15 @@ export function useConfigSync({
     // Environment flags are enough to initialize the UI bit; the heavier status
     // check still runs when the user opens /voice.
     setVoiceEnabled(process.env.HERMES_VOICE === '1')
+    let active = true
     quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
-      mtimeRef.current = Number(r?.mtime ?? 0)
+      if (active) mtimeRef.current = Number(r?.mtime ?? 0)
     })
     void hydrateFullConfig(gw, setBellOnComplete, setVoiceRecordKey)
+    return () => {
+      active = false
+      ++fullConfigRequest
+    }
   }, [gw, setBellOnComplete, setVoiceEnabled, setVoiceRecordKey, sid])
 
   useEffect(() => {
@@ -263,8 +287,10 @@ export function useConfigSync({
       return
     }
 
+    let active = true
     const id = setInterval(() => {
       quietRpc<ConfigMtimeResponse>(gw, 'config.get', { key: 'mtime' }).then(r => {
+        if (!active || getUiState().sid !== sid) return
         const next = Number(r?.mtime ?? 0)
 
         if (!mtimeRef.current) {
@@ -282,13 +308,16 @@ export function useConfigSync({
         mtimeRef.current = next
 
         quietRpc<ReloadMcpResponse>(gw, 'reload.mcp', { session_id: sid, confirm: true }).then(
-          r => r && turnController.pushActivity('MCP reloaded after config change')
+          r => active && r && turnController.pushActivity('MCP reloaded after config change')
         )
         void hydrateFullConfig(gw, setBellOnComplete, setVoiceRecordKey)
       })
     }, MTIME_POLL_MS)
 
-    return () => clearInterval(id)
+    return () => {
+      active = false
+      clearInterval(id)
+    }
   }, [gw, setBellOnComplete, setVoiceRecordKey, sid])
 }
 
