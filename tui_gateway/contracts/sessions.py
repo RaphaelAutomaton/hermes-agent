@@ -461,10 +461,11 @@ class SessionStatusParams(SessionParams):
 
 class SessionStatusResult(Result):
     output: str
+    usage: Usage | None = None
 
 
 method("session.status", params=SessionStatusParams, result=SessionStatusResult,
-       doc="Rendered /status text for the session.")
+       doc="Rendered /status text and structured token/context counters for the session.")
 
 
 class SessionHistoryParams(SessionParams):

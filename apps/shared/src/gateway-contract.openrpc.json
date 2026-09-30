@@ -3482,7 +3482,7 @@
     },
     {
       "name": "session.status",
-      "summary": "Rendered /status text for the session.",
+      "summary": "Rendered /status text and structured token/context counters for the session.",
       "params": [
         {
           "name": "params",
@@ -31430,6 +31430,17 @@
           "output": {
             "title": "Output",
             "type": "string"
+          },
+          "usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Usage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [

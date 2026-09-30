@@ -3307,6 +3307,7 @@ export interface SessionStatusParams {
 }
 export interface SessionStatusResult {
   output: string
+  usage?: Usage | null
 }
 export interface SessionHistoryParams {
   session_id: string
@@ -5245,7 +5246,7 @@ export interface RpcMethods {
   'session.save': { params: SessionSaveParams; result: SessionSaveResult }
   /** Set/clear hidden (out of the default list, still resumable by its owner) on a session + lineage. */
   'session.set_hidden': { params: SessionSetHiddenParams; result: SessionSetHiddenResult }
-  /** Rendered /status text for the session. */
+  /** Rendered /status text and structured token/context counters for the session. */
   'session.status': { params: SessionStatusParams; result: SessionStatusResult }
   /** Inject text into the next tool result without interrupting the turn. */
   'session.steer': { params: SessionCorrectionParams; result: SessionCorrectionResult }
